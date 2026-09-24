@@ -3961,7 +3961,8 @@ export function readBotSkillPolicy(raw: unknown): BotSkillPolicy | undefined {
  *
  * Removal plan: delete together with every site marked
  * `[legacy-thinkingCard]` (grep `thinkingCard` under src/) no earlier than
- * v3.33.0 — at least three minor releases after this compat ships. Removing it restores default-on for any un-migrated key, so bump
+ * v3.33.0 — at least three minor releases after this compat ships.
+ * Removing it restores default-on for any un-migrated key, so bump
  * the floor release if old keys still show up in support.
  */
 export function normalizeCotEnabled(entry?: { cotEnabled?: unknown; thinkingCard?: unknown }): boolean {
