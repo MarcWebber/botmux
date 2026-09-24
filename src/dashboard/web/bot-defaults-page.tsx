@@ -133,7 +133,7 @@ const MAX_SG_TAG_NAME_LENGTH = 60;
 
 type StatusMessage = { text: string; ok?: boolean } | null;
 type PatchBot = (appId: string, patch: Partial<BotDefaultsRow> | ((bot: BotDefaultsRow) => BotDefaultsRow)) => void;
-type CardPrefPatch = Record<string, boolean | string | StreamingCardButtonId[]>;
+type CardPrefPatch = Record<string, boolean | string | string[]>;
 
 type JsonResponse = {
   ok: boolean;
@@ -791,6 +791,7 @@ function patchCardPrefsFromBody(bot: BotDefaultsRow, body: any): BotDefaultsRow 
     groupJoinCommandEnabled: body.groupJoinCommandEnabled,
     groupJoinCommand: body.groupJoinCommand,
     autoStartOnNewTopic: body.autoStartOnNewTopic,
+    autoStartExcludedChats: body.autoStartExcludedChats,
     regularGroupReplyMode: body.regularGroupReplyMode,
     regularGroupMentionMode: body.regularGroupMentionMode,
     docSubscribeDefaultMode: body.docSubscribeDefaultMode,
@@ -3490,6 +3491,8 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
   const [inviteOwner, setInviteOwner] = useState(bot.autoInviteOwnerOnGroupAdd !== false);
   const [onJoin, setOnJoin] = useState(bot.autoStartOnGroupJoin === true);
   const [onTopic, setOnTopic] = useState(bot.autoStartOnNewTopic === true);
+  const [showExcluded, setShowExcluded] = useState(false);
+  const [excluded, setExcluded] = useState((bot.autoStartExcludedChats ?? []).join('\n'));
   const [prompt, setPrompt] = useState(typeof bot.autoStartOnGroupJoinPrompt === 'string' ? bot.autoStartOnGroupJoinPrompt : '');
   // 编辑态软预填：未自定义时显示内置默认文案，只有点保存才落盘（空 = 跟随动态默认）。
   const [seed, setSeed] = useState(bot.autoStartOnGroupJoinSeed || bot.autoStartOnGroupJoinSeedDefault || '');
@@ -3504,6 +3507,7 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
     setInviteOwner(bot.autoInviteOwnerOnGroupAdd !== false);
     setOnJoin(bot.autoStartOnGroupJoin === true);
     setOnTopic(bot.autoStartOnNewTopic === true);
+    setExcluded((bot.autoStartExcludedChats ?? []).join('\n'));
     setPrompt(typeof bot.autoStartOnGroupJoinPrompt === 'string' ? bot.autoStartOnGroupJoinPrompt : '');
     setSeed(bot.autoStartOnGroupJoinSeed || bot.autoStartOnGroupJoinSeedDefault || '');
     setJoinCmdOn(bot.groupJoinCommandEnabled === true);
@@ -3516,6 +3520,7 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
     bot.autoStartOnGroupJoinSeed,
     bot.autoStartOnGroupJoinSeedDefault,
     bot.autoStartOnNewTopic,
+    bot.autoStartExcludedChats,
     bot.groupJoinCommandEnabled,
     bot.groupJoinCommand,
   ]);
@@ -3537,6 +3542,12 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
   return (
     <div className="bd-subsection">
       <h4 className="bd-subsection-title">{tr('botDefaults.sectionAutoStart')}</h4>
+      <button type="button" data-action="toggle-auto-start-exclusions" aria-expanded={showExcluded} onClick={() => setShowExcluded(!showExcluded)}>{tr('botDefaults.autoStartExcludedChats')}</button>
+      {showExcluded && <div className="bd-row"><label>
+        {tr('botDefaults.autoStartExcludedChatsHelp')}
+        <textarea data-input="autoStartExcludedChats" rows={3} value={excluded} placeholder={'oc_xxx\noc_yyy'} onChange={e => setExcluded(e.currentTarget.value)} />
+        <button type="button" data-action="save-auto-start-exclusions" disabled={busy === 'excluded'} onClick={() => void savePatch({ autoStartExcludedChats: excluded.split(/\r?\n/).map(id => id.trim()).filter(Boolean) }, 'excluded')}>{tr('common.save')}</button>
+      </label></div>}
       <ToggleRow
         checked={inviteOwner}
         disabled={busy === 'inviteOwner'}

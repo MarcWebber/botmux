@@ -39,6 +39,22 @@ async function flushAction(action: () => void): Promise<void> {
   });
 }
 
+describe('auto-start excluded chats editor', () => {
+  it('opens, saves one ID per line, and clears exclusions', async () => {
+    const { renderer, putCardPref } = renderControls('app_a', 'seed');
+    act(() => renderer.root.findByProps({ 'data-action': 'toggle-auto-start-exclusions' }).props.onClick());
+    const input = () => renderer.root.findByProps({ 'data-input': 'autoStartExcludedChats' });
+    const save = () => renderer.root.findByProps({ 'data-action': 'save-auto-start-exclusions' }).props.onClick();
+    act(() => input().props.onChange({ currentTarget: { value: ' oc_one \r\n\noc_two' } }));
+    await flushAction(save);
+    expect(putCardPref).toHaveBeenLastCalledWith({ autoStartExcludedChats: ['oc_one', 'oc_two'] });
+    updateControls(renderer, putCardPref, 'app_b', 'seed');
+    expect(input().props.value).toBe('');
+    await flushAction(save);
+    expect(putCardPref).toHaveBeenLastCalledWith({ autoStartExcludedChats: [] });
+  });
+});
+
 describe('Bot 默认设置 — 入群 seed 草稿同步', () => {
   it('切换 Bot 时丢弃上一 Bot 的未保存草稿', () => {
     const { renderer, putCardPref } = renderControls('app_a', '默认文案');
