@@ -6748,7 +6748,7 @@ botmux skills 注入方式（仅影响 codex/gemini/opencode 等只支持全局 
 提示: 多数子命令支持 \`botmux <子命令> --help\` 查看完整参数。
 
 配置目录: ~/.botmux/
-文档: https://github.com/deepcoldy/botmux
+文档: https://deepcoldy.github.io/botmux/
 `);
 }
 
