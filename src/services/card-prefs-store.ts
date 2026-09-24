@@ -87,7 +87,7 @@ export interface BotCardPrefs {
    *  Default TRUE (unlike the others) — only an explicit false is persisted. */
   botToBotSameDir: boolean;
   /** 被动入群（bot.added）时自动把 owner 拉进群。缺省 = 开；只有显式 false
-   *  持久化（同 thinkingCard 约定）。 */
+   *  持久化（同 cotEnabled 约定）。 */
   autoInviteOwnerOnGroupAdd: boolean;
   /** 主动开工 — 场景①: auto-start when added to a new chat (see auto-start.ts). */
   autoStartOnGroupJoin: boolean;
