@@ -90,7 +90,7 @@ import { setCardMode } from '../services/card-mode-store.js';
 import { setChatStreamingCardPin } from '../services/pin-streaming-card-mode-store.js';
 import { setCotMode } from '../services/cot-mode-store.js';
 import { handleCotThinkingUpdate } from '../im/lark/cot-message.js';
-import { canOperate } from '../im/lark/event-dispatcher.js';
+import { canOperate, isKnownPeerBot } from '../im/lark/event-dispatcher.js';
 import { buildSafeInsightReport } from '../services/insight/report.js';
 import type { SafeInsightReport } from '../services/insight/types.js';
 import { invalidWorkingDirs } from '../utils/working-dir.js';
@@ -5301,11 +5301,36 @@ export async function handleCommand(
           await sessionReply(rootId, t('cmd.fork.no_sender', undefined, loc));
           break;
         }
-        // Owner-only.
-        if (ds.session.ownerOpenId && ds.session.ownerOpenId !== forkSenderOpenId) {
+        // 会话发起人闸：默认只有发起人能 fork 自己的会话。**例外**：bot 的管理员
+        // （canOperate / allowedUsers）可以 fork 本 bot 的任意会话——他们本来就能
+        // /close /restart 掉这个会话，"能销毁却不能拷贝一份"没有安全意义；而 fork
+        // 是非破坏性的（源会话不动，子会话另起 anchor），放开只增不减。
+        // 非管理员仍限自己发起的会话，不因这条例外扩大。
+        const forkByAdminOfOthers = !!ds.session.ownerOpenId
+          && ds.session.ownerOpenId !== forkSenderOpenId;
+        if (forkByAdminOfOthers && !canOperate(forkAppId, ds.chatId, forkSenderOpenId)) {
           await sessionReply(rootId, t('cmd.fork.not_owner', undefined, loc));
           break;
         }
+        // 「真人管理员」fork 别人的会话时，子会话归**发起 fork 的管理员**，不继承源
+        // owner：`/fork --create` 建的新群里只有管理员自己，把子会话记在一个不在群里
+        // 的人名下会让 owner-only 回复、子会话上的 /fork /relay 全部指错人。
+        //
+        // **bot 发送方绝不能被盖成 owner**：canOperate 在开放模式（没配任何 allowlist）
+        // 下是「任何人含 peer bot」全放行，单看闸会把 bot 放进这条分支。而全仓维护着
+        // 「ownerOpenId 必须是真人」的不变量（见 daemon isForeignBotSender：bot 当 owner
+        // ⟹ owner-only 回复每次都 @ 醒它 ⟹ 自触发/重入循环，还漏 owner-gated 界面）。
+        // bot 判定要与 daemon isForeignBotSender 同口径，是两条腿的 OR：
+        //   ① 飞书盖章的 senderType=app/bot；
+        //   ② cross-ref 兜底——个别事件没盖 app/bot，但 open_id 已在 peer 互导表里
+        //      （daemon 仍按 bot 把它路由进斜杠闸，缺这腿会漏）。
+        // bot 走这里时不下发 childOwnerOpenId，子会话退回继承源 owner。闸本身不动——
+        // 限制模式下非 operator 的 bot 仍被上面那条 canOperate 拒，不会因这里而漏进来。
+        const forkSenderIsBot = message.senderType === 'app' || message.senderType === 'bot'
+          || isKnownPeerBot(config.session.dataDir, forkAppId, forkSenderOpenId);
+        const forkChildOwnerOpenId = forkByAdminOfOthers && !forkSenderIsBot
+          ? forkSenderOpenId
+          : undefined;
         // Capability gate — refuse non-forkable backends up front with a clear,
         // typed message (mirrors the design doc §4 refusal). Cheap check before
         // we create any group.
@@ -5363,7 +5388,7 @@ export async function handleCommand(
             break;
           }
 
-          const result = await startForkSubtopicSession(argsLine, ds, message, forkAppId);
+          const result = await startForkSubtopicSession(argsLine, ds, message, forkAppId, forkChildOwnerOpenId);
           if (!result.ok) {
             const errKey = result.error === 'worker_busy' ? 'cmd.fork.mid_turn'
               : result.error === 'adopt_not_forkable' ? 'cmd.fork.adopt_not_forkable'
@@ -5467,6 +5492,7 @@ export async function handleCommand(
         // the raw session title.
         const forkResult = await forkSession(ds.session.sessionId, forkChatId, forkChatId, 'group', 'chat', {
           forkTaskText: forkGroupName,
+          childOwnerOpenId: forkChildOwnerOpenId,
         });
         if (!forkResult.ok) {
           // Residual-orphan cleanup: the front guards already ran before
@@ -6283,6 +6309,9 @@ export async function startForkSubtopicSession(
   parentDs: DaemonSession,
   message: LarkMessage,
   larkAppId?: string,
+  /** Owner for the child session; omit to inherit the parent's. Set by the
+   *  `/fork` handler when an admin forks someone else's session. */
+  childOwnerOpenId?: string,
 ): Promise<ForkSubtopicResult> {
   const appId = parentDs.larkAppId ?? larkAppId;
   if (!appId) return { ok: false, error: 'missing_lark_app_id', orphanTopic: false };
@@ -6372,6 +6401,7 @@ export async function startForkSubtopicSession(
         turnId: message.messageId,
         senderOpenId: triggerSender.openId,
         senderIsBot,
+        childOwnerOpenId,
         buildInitialPrompt: childSessionId => buildNewTopicCliInput(
           `${childIntro}\n\n${taskText}`,
           childSessionId,

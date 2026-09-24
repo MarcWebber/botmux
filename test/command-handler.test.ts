@@ -6,7 +6,7 @@
  *
  * Run:  pnpm vitest run test/command-handler.test.ts
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // ─── Mock external modules ──────────────────────────────────────────────────
 
@@ -524,6 +524,9 @@ vi.mock('../src/services/oncall-store.js', () => ({
 // own open-mode / allowlist / peer-bot logic (that lives in event-dispatcher).
 vi.mock('../src/im/lark/event-dispatcher.js', () => ({
   canOperate: vi.fn(() => true),
+  // cross-ref bot 兜底腿默认 false（人类）；个别用例翻成 true 模拟「事件没盖
+  // app/bot、但 open_id 已在 peer 互导表里」的 bot。
+  isKnownPeerBot: vi.fn(() => false),
 }));
 
 vi.mock('../src/services/bot-union-ids-store.js', () => ({
@@ -583,7 +586,7 @@ import { type CloseSessionResult, closeSession, closeSession as closeWorkerPoolS
 import { dashboardEventBus, type DashboardEvent } from '../src/core/dashboard-events.js';
 import { publishClosedSessionPatch } from '../src/core/session-activity.js';
 import { getOwnerOpenId } from '../src/bot-registry.js';
-import { canOperate } from '../src/im/lark/event-dispatcher.js';
+import { canOperate, isKnownPeerBot } from '../src/im/lark/event-dispatcher.js';
 import { deleteWorktreeCleanupJob, getWorktreeCleanupJob, putWorktreeCleanupJob } from '../src/services/worktree-cleanup-store.js';
 import { getBotUnionId } from '../src/services/bot-union-ids-store.js';
 import { isTeamBot } from '../src/services/team-bots-store.js';
@@ -1944,6 +1947,127 @@ describe('handleCommand', () => {
     });
   });
 
+  // 会话发起人闸放宽：bot 管理员（canOperate）能 fork 本 bot 的任意会话。
+  // 理由是权限单调性——管理员本来就能 /close /restart 掉这个会话，"能销毁却不能
+  // 拷贝一份"没有安全意义；fork 又是非破坏性的（源会话不动）。非管理员不受影响。
+  describe('/fork 发起人闸 — 管理员例外', () => {
+    afterEach(() => {
+      vi.mocked(canOperate).mockReturnValue(true);
+      vi.mocked(isKnownPeerBot).mockReturnValue(false);
+    });
+
+    it('非发起人且非管理员（canOperate=false）→ 拒，不建话题', async () => {
+      vi.mocked(canOperate).mockReturnValue(false);
+      const ds = makeDaemonSession({
+        scope: 'thread',
+        lastScreenStatus: 'idle',
+        session: makeSession({ ownerOpenId: 'ou_other_user', cliSessionId: 'cli-parent-1', scope: 'thread' }),
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/fork', ROOT_ID, makeLarkMessage('/fork 接手排查', { threadId: 'omt_parent' }), deps, LARK_APP_ID);
+
+      const reply = (deps.sessionReply as ReturnType<typeof vi.fn>).mock.calls[0][1] as string;
+      expect(reply).toContain('发起人');
+      expect(sendMessage).not.toHaveBeenCalled();
+      expect(forkSession).not.toHaveBeenCalled();
+    });
+
+    it('非发起人但是管理员（canOperate=true）→ 放行，子会话归 fork 发起的管理员', async () => {
+      const ds = makeDaemonSession({
+        scope: 'thread',
+        lastScreenStatus: 'idle',
+        session: makeSession({ ownerOpenId: 'ou_other_user', cliSessionId: 'cli-parent-1', scope: 'thread' }),
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/fork', ROOT_ID, makeLarkMessage('/fork 接手排查', { threadId: 'omt_parent' }), deps, LARK_APP_ID);
+
+      expect(forkSession).toHaveBeenCalled();
+      // 关键：子会话 owner 改记成 ou_sender（发 fork 的管理员），不继承 ou_other_user。
+      // 否则 --create 建的新群里只有管理员自己，owner-only 回复会指向一个不在群里的人。
+      expect(vi.mocked(forkSession).mock.calls[0][5]).toMatchObject({ childOwnerOpenId: 'ou_sender' });
+    });
+
+    it('发起人自己 fork → childOwnerOpenId 不下发（继承源 owner，保持现状）', async () => {
+      const ds = makeDaemonSession({
+        scope: 'thread',
+        lastScreenStatus: 'idle',
+        session: makeSession({ ownerOpenId: 'ou_sender', cliSessionId: 'cli-parent-1', scope: 'thread' }),
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand('/fork', ROOT_ID, makeLarkMessage('/fork 接手排查', { threadId: 'omt_parent' }), deps, LARK_APP_ID);
+
+      expect(forkSession).toHaveBeenCalled();
+      expect(vi.mocked(forkSession).mock.calls[0][5]?.childOwnerOpenId).toBeUndefined();
+    });
+
+    it('bot 发送方即使 canOperate=true（开放模式）也不被盖成 owner（bot 绝不当 ownerOpenId）', async () => {
+      // 回归：canOperate 的开放模式腿对 peer bot 也放行；闸只判 canOperate 时，bot 会被
+      // 盖成子会话 owner，违反「ownerOpenId 必须是真人」的不变量（owner-only 回复每次
+      // 都 @ 醒它 ⟹ 自触发/重入循环）。闸仍放行（开放模式管理员例外），只是不改 owner。
+      const ds = makeDaemonSession({
+        scope: 'thread',
+        lastScreenStatus: 'idle',
+        session: makeSession({ ownerOpenId: 'ou_human_owner', cliSessionId: 'cli-parent-1', scope: 'thread' }),
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand(
+        '/fork', ROOT_ID,
+        makeLarkMessage('/fork 接手排查', { threadId: 'omt_parent', senderId: 'ou_peer_bot', senderType: 'app' }),
+        deps, LARK_APP_ID,
+      );
+
+      expect(forkSession).toHaveBeenCalled();
+      // bot 过闸但不能被盖成 owner：childOwnerOpenId 缺省 ⟹ 子会话退回继承源真人 owner。
+      expect(vi.mocked(forkSession).mock.calls[0][5]?.childOwnerOpenId).toBeUndefined();
+    });
+
+    it('事件没盖 app/bot 但 open_id 在 peer cross-ref 里的 bot 也不被盖成 owner（兜底腿）', async () => {
+      // daemon isForeignBotSender 是 senderType OR isKnownPeerBot 两条腿；这类消息仍被当
+      // bot 路由进 /fork。只判 senderType 会漏掉它，再把 bot 盖成 owner。
+      vi.mocked(isKnownPeerBot).mockReturnValue(true);
+      const ds = makeDaemonSession({
+        scope: 'thread',
+        lastScreenStatus: 'idle',
+        session: makeSession({ ownerOpenId: 'ou_human_owner', cliSessionId: 'cli-parent-1', scope: 'thread' }),
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand(
+        '/fork', ROOT_ID,
+        // senderType 留默认 'user'（模拟飞书没盖 app/bot 的边角），仅靠 cross-ref 认出 bot。
+        makeLarkMessage('/fork 接手排查', { threadId: 'omt_parent', senderId: 'ou_peer_bot' }),
+        deps, LARK_APP_ID,
+      );
+
+      expect(forkSession).toHaveBeenCalled();
+      // 行为判据（不是「函数被调用」）：缺 senderType 戳记时仍靠 cross-ref 认出 bot，
+      // childOwnerOpenId 必须缺省 ⟹ 子会话退回继承源真人 owner，而不是盖成 ou_peer_bot。
+      expect(vi.mocked(forkSession).mock.calls[0][5]?.childOwnerOpenId).toBeUndefined();
+    });
+
+    it('真人（非 cross-ref bot、senderType=user）管理员 fork 别人会话仍正常改记 owner', async () => {
+      // 反例守卫：加固不能把真人管理员也误判成 bot。isKnownPeerBot 默认 false。
+      const ds = makeDaemonSession({
+        scope: 'thread',
+        lastScreenStatus: 'idle',
+        session: makeSession({ ownerOpenId: 'ou_other_user', cliSessionId: 'cli-parent-1', scope: 'thread' }),
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand(
+        '/fork', ROOT_ID,
+        makeLarkMessage('/fork 接手排查', { threadId: 'omt_parent' }),
+        deps, LARK_APP_ID,
+      );
+
+      expect(vi.mocked(forkSession).mock.calls[0][5]).toMatchObject({ childOwnerOpenId: 'ou_sender' });
+    });
+  });
+
   describe('/fork --create lineage durability', () => {
     it('persists parent lineage even when the created-notice reply fails (expired root → 400)', async () => {
       // Regression for the ordering blocker: the "created" notice is a reply to
@@ -1988,6 +2112,35 @@ describe('handleCommand', () => {
       expect(ds.session.forkChildSessionIds).toEqual(['child-create-1']);
       expect(sessionStore.updateSession).toHaveBeenCalledWith(
         expect.objectContaining({ forkChildSessionIds: ['child-create-1'] }),
+      );
+    });
+
+    it('管理员（非发起人）走 --create：childOwnerOpenId 也必须传给新群那条 fork', async () => {
+      // 反变异守卫：--create 路径与子话题路径是两条独立的 forkSession 调用。若 --create
+      // 漏传 childOwnerOpenId，新群里只有管理员自己，子会话却继承了不在群里的源 owner。
+      vi.mocked(forkSession).mockResolvedValueOnce({ ok: true, childSessionId: 'child-create-admin' });
+      const ds = makeDaemonSession({
+        scope: 'chat',
+        lastScreenStatus: 'idle',
+        session: makeSession({ ownerOpenId: 'ou_other_user', scope: 'chat', cliId: 'codex' }),
+      });
+      const deps = makeDeps(ds);
+
+      await handleCommand(
+        '/fork',
+        ROOT_ID,
+        makeLarkMessage('/fork --create 接手群'),
+        deps,
+        LARK_APP_ID,
+      );
+
+      expect(forkSession).toHaveBeenCalledWith(
+        'sess-001',
+        expect.any(String),
+        expect.any(String),
+        'group',
+        'chat',
+        expect.objectContaining({ forkTaskText: '接手群', childOwnerOpenId: 'ou_sender' }),
       );
     });
   });
