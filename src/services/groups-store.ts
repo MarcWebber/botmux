@@ -281,19 +281,6 @@ export function isPermanentChatManagerErrorCode(code: number | undefined): boole
 }
 
 /**
- * 判断是否属于瞬时可重试的错误码（建群异步索引延迟、服务端内部错误、限频、服务端 5xx）。
- */
-export function isTransientChatManagerErrorCode(code: number | undefined): boolean {
-  return (
-    code === 232011 ||   // 用户不在群聊中（建群后异步成员落库延迟，核心重试原因）
-    code === 40003 ||    // 服务端内部瞬时错误 (与 client.ts 约定一致)
-    code === 429 ||      // 频控
-    code === 99991400 || // 频控
-    (typeof code === 'number' && code >= 500 && code < 600)
-  );
-}
-
-/**
  * Add group managers to a chat owned by the bot.
  *
  * Calls POST /open-apis/im/v1/chats/:chat_id/managers/add_managers.
