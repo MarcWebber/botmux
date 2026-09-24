@@ -131,7 +131,7 @@ import { buildQuoteHint } from './im/lark/quote-hint.js';
 import { buildTopicThreadContext } from './im/lark/topic-root-context.js';
 import { logger } from './utils/logger.js';
 import { gracefulProcessExitCode } from './pm2-graceful-exit.js';
-import { applyAllowedUsersResolve } from './utils/allowed-users-apply.js';
+import { applyAllowedUsersResolve, shouldSilenceAllowedUsersOwnerDm, classifyAllowedUsersTerminalNotice } from './utils/allowed-users-apply.js';
 import { withFileLock, withFileLockSync } from './utils/file-lock.js';
 import {
   hasUnsettledCodexAppDispatch,
@@ -4701,19 +4701,28 @@ function notifyAllowedUsersResolveFailure(
 function scheduleAllowedUsersResolveRetry(larkAppId: string, attempt = 1): void {
   if (attempt > 3) {
     // Retries exhausted (startup + 3 retries all degraded). Don't just fall
-    // silent — the owner has been locked out for ~7.5 min and auto-recovery
+    // silent — the owner has been locked out or degraded for ~7.5 min and auto-recovery
     // won't try again. Emit a terminal notice so they know to intervene. Only
-    // when the allowlist is still actually broken: a config change or a bot
-    // teardown mid-retry is not an exhaustion worth alarming on.
+    // when the allowlist is still actually broken or running degraded on cache:
+    // a config change or a bot teardown mid-retry is not an exhaustion worth alarming on.
     try {
       const bot = getBot(larkAppId);
-      const stillConfigured = (bot.config.allowedUsers ?? []).length > 0;
-      const stillEmpty = (bot.resolvedAllowedUsers ?? []).length === 0;
-      if (stillConfigured && stillEmpty) {
+      const terminalKind = classifyAllowedUsersTerminalNotice({
+        configuredCount: (bot.config.allowedUsers ?? []).length,
+        resolvedCount: bot.resolvedAllowedUsers?.length ?? 0,
+      });
+      if (terminalKind === 'allowlist-empty') {
         notifyAllowedUsersResolveFailure(
           larkAppId,
           `allowedUsers 自动解析在启动后重试 3 次仍失败，运行时白名单为空 —— 期间包括你在内的所有人都会被拒。` +
           `请检查网络 / 飞书 contact API 后执行 \`botmux restart\` 重新解析。`,
+          bot.resolvedAllowedUsers ?? [],
+        );
+      } else if (terminalKind === 'cache-degraded') {
+        notifyAllowedUsersResolveFailure(
+          larkAppId,
+          `allowedUsers 自动解析在启动后重试 3 次仍失败，当前仍依赖本地缓存兜底运行（对话暂未受阻，但无法同步最新人员变更）。` +
+          `请检查飞书通讯录权限（如 contact:user.id:readonly 权限）或网络后执行 \`botmux restart\` 重新解析。`,
           bot.resolvedAllowedUsers ?? [],
         );
       }
@@ -27574,7 +27583,11 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           });
           logger.info(`[${cfg.larkAppId}] Resolved allowedUsers: ${bot.resolvedAllowedUsers.join(', ') || '(empty)'}${applied.usedFallback ? ' [some from cache]' : ''}`);
           if (applied.failed && applied.notice) {
-            notifyAllowedUsersResolveFailure(cfg.larkAppId, applied.notice, applied.resolved);
+            if (shouldSilenceAllowedUsersOwnerDm(applied)) {
+              logger.warn(`[${cfg.larkAppId}] ${applied.notice} (cached fallback active for transient error, silenced owner DM; scheduled retry)`);
+            } else {
+              notifyAllowedUsersResolveFailure(cfg.larkAppId, applied.notice, applied.resolved);
+            }
             scheduleAllowedUsersResolveRetry(cfg.larkAppId);
           }
         } catch (err: any) {
@@ -27596,11 +27609,17 @@ export async function startDaemon(botIndex?: number): Promise<void> {
           }
           const notice = applied.notice
             ?? `Failed to resolve allowedUsers: ${err?.message ?? err}`;
-          notifyAllowedUsersResolveFailure(
-            cfg.larkAppId,
-            `${notice} (throw: ${err?.message ?? err})`,
-            applied.resolved,
-          );
+          if (shouldSilenceAllowedUsersOwnerDm(applied)) {
+            logger.warn(
+              `[${cfg.larkAppId}] ${notice} (throw: ${err?.message ?? err}; cached fallback active, silenced owner DM; scheduled retry)`,
+            );
+          } else {
+            notifyAllowedUsersResolveFailure(
+              cfg.larkAppId,
+              `${notice} (throw: ${err?.message ?? err})`,
+              applied.resolved,
+            );
+          }
           scheduleAllowedUsersResolveRetry(cfg.larkAppId);
         }
       }
