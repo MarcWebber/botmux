@@ -72,12 +72,12 @@ export function bytedcliHomeFor(openId: string): string {
  *  The bare HOME does NOT count: {@link runAsUser} mkdirs it on every call, so
  *  a single (even failed) `--begin` would otherwise read as "authorized" until
  *  the directory was manually removed. bytedcli writes the SSO credential at
- *  the data root (`~/.local/share/bytedcli/token.json`, `token.<env>.json` for
+ *  the data root (`~/.local/share/bytedcli/data/token.json`, `token.<env>.json` for
  *  other SSO environments, `sso_session*.json` for the browser-session flow);
  *  only one of those proves a login happened. */
 export function hasBytedcliHome(openId: string): boolean {
   try {
-    const dataRoot = join(bytedcliHomeFor(openId), '.local', 'share', 'bytedcli');
+    const dataRoot = join(bytedcliHomeFor(openId), '.local', 'share', 'bytedcli', 'data');
     if (!existsSync(dataRoot)) return false;
     return readdirSync(dataRoot).some(f =>
       /^token(\.[a-z0-9-]+)?\.json$/.test(f) || /^sso_session(\.[a-z0-9-]+)?\.json$/.test(f));

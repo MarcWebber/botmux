@@ -90,7 +90,7 @@ describe('bytedcliHomeFor — the isolation boundary', () => {
 });
 
 function writeBytedData(mod: Awaited<ReturnType<typeof fresh>>, openId: string, rel: string) {
-  const full = join(mod.bytedcliHomeFor(openId), '.local', 'share', 'bytedcli', rel);
+  const full = join(mod.bytedcliHomeFor(openId), '.local', 'share', 'bytedcli', 'data', rel);
   mkdirSync(join(full, '..'), { recursive: true });
   writeFileSync(full, '{}');
 }
@@ -104,8 +104,8 @@ describe('hasBytedcliHome — a real credential, not a bare directory (F2)', () 
 
   it('is false with only the blank-run boilerplate files', async () => {
     const mod = await fresh();
-    writeBytedData(mod, ALICE, 'data/trace_optin.json');
-    writeBytedData(mod, ALICE, 'data/self_update_version.json');
+    writeBytedData(mod, ALICE, 'trace_optin.json');
+    writeBytedData(mod, ALICE, 'self_update_version.json');
     mkdirSync(join(mod.bytedcliHomeFor(ALICE), 'logs'), { recursive: true });
     mkdirSync(join(mod.bytedcliHomeFor(ALICE), 'traces'), { recursive: true });
     expect(mod.hasBytedcliHome(ALICE)).toBe(false);
@@ -115,12 +115,14 @@ describe('hasBytedcliHome — a real credential, not a bare directory (F2)', () 
     const mod = await fresh();
     writeBytedData(mod, ALICE, 'token.json');
     expect(mod.hasBytedcliHome(ALICE)).toBe(true);
+    expect(mod.hasBytedcliHome(BOB)).toBe(false);
   });
 
   it('accepts other-env tokens and browser-session files', async () => {
     const modA = await fresh();
     writeBytedData(modA, ALICE, 'token.tiktok.json');
     expect(modA.hasBytedcliHome(ALICE)).toBe(true);
+    modA.clearBytedcliAuth(ALICE);
     const modB = await fresh();
     writeBytedData(modB, ALICE, 'sso_session.json');
     expect(modB.hasBytedcliHome(ALICE)).toBe(true);
@@ -208,13 +210,9 @@ describe('login — device code, in two steps', () => {
 });
 
 describe('mintBytedcliJwts — fresh per turn, never borrowed', () => {
-  /** Stand in for a completed login: the HOME exists. */
-  // A completed login is what bytedcli actually writes: the SSO token at the
-  // bytedcli data root. A bare directory does NOT count (runAsUser creates it on
-  // every call) — hasBytedcliHome must not mistake a begin-created HOME for a
-  // login.
+  // Match bytedcli's credential layout; a bare HOME is not a completed login.
   function markLoggedIn(mod: { bytedcliHomeFor: (id: string) => string }, openId: string) {
-    const dataRoot = join(mod.bytedcliHomeFor(openId), '.local', 'share', 'bytedcli');
+    const dataRoot = join(mod.bytedcliHomeFor(openId), '.local', 'share', 'bytedcli', 'data');
     mkdirSync(dataRoot, { recursive: true });
     writeFileSync(join(dataRoot, 'token.json'), '{"sso":"yes"}');
   }
