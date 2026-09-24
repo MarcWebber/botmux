@@ -265,6 +265,113 @@ export async function transferChatOwner(
 }
 
 /**
+ * Add managers to a chat with bounded retries before failing.
+ * The calling bot must currently be the owner of the chat.
+ * Calls POST /open-apis/im/v1/chats/:chat_id/managers/add_managers
+ * Accepts open_id, union_id, or user_id.
+ */
+/**
+ * 飞书群管 API 常见永久错误（权限未开通/缺失、非群主、群状态异常等），遇到后直接 fail-fast，不浪费重试预算。
+ */
+export function isPermanentChatManagerErrorCode(code: number | undefined): boolean {
+  return (
+    code === 99991672 || // 权限未配置 (缺失 im:chat.managers:write_only)
+    code === 99991663 || // 租户未开启此权限
+    code === 232001 ||   // 当前用户无操作权限
+    code === 232009 ||   // 群不存在或已解散或状态异常
+    code === 232014 ||   // 群管理员人数已达上限
+    code === 232018 ||   // 群类型不支持
+    code === 232025 ||   // 仅群主可以添加管理员
+    code === 40001 ||    // token invalid
+    code === 40003       // 参数非法
+  );
+}
+
+/**
+ * 判断是否属于瞬时可重试的错误码（建群异步索引延迟、限频、服务端 5xx）。
+ */
+export function isTransientChatManagerErrorCode(code: number | undefined): boolean {
+  return (
+    code === 232011 ||   // 用户不在群聊中（建群后异步成员落库延迟，核心重试原因）
+    code === 429 ||      // 频控
+    code === 99991400 || // 频控
+    (typeof code === 'number' && code >= 500 && code < 600)
+  );
+}
+
+/**
+ * Add group managers to a chat owned by the bot.
+ *
+ * Calls POST /open-apis/im/v1/chats/:chat_id/managers/add_managers.
+ * Includes bounded exponential backoff retry for transient errors (e.g. 232011 user indexing lag).
+ * Permanent errors (such as missing scope or permission denied) fail-fast immediately without retry.
+ */
+export async function addChatManagers(
+  ownerLarkAppId: string,
+  chatId: string,
+  managerIds: string[],
+  memberIdType: 'open_id' | 'union_id' | 'user_id' = 'open_id',
+  opts?: { maxRetries?: number; retryDelayMs?: number },
+): Promise<{ ok: true; addedManagers: string[] } | { ok: false; error: string }> {
+  const filtered = managerIds.filter(Boolean);
+  if (filtered.length === 0) return { ok: true, addedManagers: [] };
+  const client = getBotClient(ownerLarkAppId);
+  const maxRetries = opts?.maxRetries ?? 2;
+  const retryDelayMs = opts?.retryDelayMs ?? (process.env.NODE_ENV === 'test' ? 1 : 200);
+  let lastError = 'unknown';
+
+  for (let attempt = 1; attempt <= maxRetries + 1; attempt++) {
+    try {
+      const fn = (client as any).im?.v1?.chatManagers?.addManagers;
+      let res: any;
+      if (typeof fn === 'function') {
+        res = await (client as any).im.v1.chatManagers.addManagers({
+          path: { chat_id: chatId },
+          params: { member_id_type: memberIdType },
+          data: { manager_ids: filtered },
+        });
+      } else {
+        res = await (client as any).request({
+          method: 'POST',
+          url: `/open-apis/im/v1/chats/${encodeURIComponent(chatId)}/managers/add_managers`,
+          params: { member_id_type: memberIdType },
+          data: { manager_ids: filtered },
+        });
+      }
+      if (res.code === 0 || res.code === undefined) {
+        const added = Array.isArray(res.data?.chat_managers) ? res.data.chat_managers : filtered;
+        return { ok: true, addedManagers: added };
+      }
+      lastError = `${res.msg ?? 'unknown'} (code: ${res.code})`;
+      const isPermanent = isPermanentChatManagerErrorCode(res.code);
+      if (isPermanent || !isTransientChatManagerErrorCode(res.code)) {
+        logger.warn(
+          `[groups-store] addChatManagers permanent error code=${res.code} (${res.msg}) for chat=${chatId.substring(0, 12)}, skipping retry`,
+        );
+        return { ok: false, error: lastError };
+      }
+    } catch (e: any) {
+      lastError = e?.message ?? String(e);
+      const errCode = e?.code ?? e?.status;
+      if (typeof errCode === 'number' && isPermanentChatManagerErrorCode(errCode)) {
+        logger.warn(
+          `[groups-store] addChatManagers permanent thrown error code=${errCode} for chat=${chatId.substring(0, 12)}, skipping retry`,
+        );
+        return { ok: false, error: lastError };
+      }
+    }
+    if (attempt <= maxRetries) {
+      logger.info(
+        `[groups-store] addChatManagers attempt ${attempt} transient failure for chat=${chatId.substring(0, 12)} (${lastError}); retrying in ${retryDelayMs * attempt}ms...`,
+      );
+      await new Promise(r => setTimeout(r, retryDelayMs * attempt));
+    }
+  }
+
+  return { ok: false, error: lastError };
+}
+
+/**
  * Disband a chat the calling bot OWNS. Used by the session-group birth flow
  * to clean up an orphan group when the initiating user's invite was rejected
  * — the group can never serve as a conversation home, so leaving it behind
