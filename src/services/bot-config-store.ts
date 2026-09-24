@@ -149,7 +149,8 @@ export const CONFIG_FIELDS: readonly ConfigFieldSpec[] = [
 
 /** 大小写不敏感地按 key 找字段 spec。 */
 export function findConfigField(key: string): ConfigFieldSpec | undefined {
-  const k = key.trim().toLowerCase();
+  const requested = key.trim().toLowerCase();
+  const k = requested === 'thinkingcard' ? 'cotenabled' : requested;
   return CONFIG_FIELDS.find(f => f.key.toLowerCase() === k);
 }
 
@@ -368,8 +369,10 @@ async function applyConfigFieldInternal(
         return { write: false, result: `invalid_cli_launch_mode: ${(e as Error).message}` };
       }
     } else if (effective === null) {
+      if (spec.configKey === 'cotEnabled') delete entry.thinkingCard;
       delete entry[spec.configKey];
     } else if (spec.kind === 'boolean') {
+      if (spec.configKey === 'cotEnabled') delete entry.thinkingCard;
       // 只持久化「非默认」的一侧，bots.json 保持干净：默认 OFF 的字段 true 才写、
       // false 删 key；默认 ON（defaultOn）的字段 false 才写、true 删 key。
       if (spec.defaultOn) {

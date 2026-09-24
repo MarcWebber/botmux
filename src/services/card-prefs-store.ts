@@ -34,6 +34,7 @@ import { rmwBotEntry } from './config-store.js';
 import {
   getBot,
   normalizeUsageDisplay,
+  normalizeCotEnabled,
   DEFAULT_USAGE_DISPLAY,
   type ChatReplyMode,
   type UsageDisplayMode,
@@ -275,6 +276,7 @@ async function updateBotCardPrefsInternal(
     apply(entry, 'codexBrowser', patch.codexBrowser);
     apply(entry, 'writableTerminalLinkInCard', patch.writableTerminalLinkInCard);
     apply(entry, 'privateCard', patch.privateCard);
+    if (patch.cotEnabled !== undefined) delete entry.thinkingCard;
     applyDefaultTrue(entry, 'cotEnabled', patch.cotEnabled);
     applyDefaultTrue(entry, 'senderTag', patch.senderTag);
     apply(entry, 'overloadAlert', patch.overloadAlert);
@@ -305,7 +307,7 @@ async function updateBotCardPrefsInternal(
           || (typeof entry.codexBrowser === 'object' && entry.codexBrowser?.enabled === true),
         writableTerminalLinkInCard: entry.writableTerminalLinkInCard === true,
         privateCard: entry.privateCard === true,
-        cotEnabled: entry.cotEnabled !== false,
+        cotEnabled: normalizeCotEnabled(entry),
         senderTag: entry.senderTag !== false,
         overloadAlert: entry.overloadAlert === true,
         botToBotSameDir: entry.botToBotSameDir !== false,

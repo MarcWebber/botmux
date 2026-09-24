@@ -3810,7 +3810,7 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       hiddenStreamingCardButtons: normalizeHiddenStreamingCardButtons(entry.hiddenStreamingCardButtons),
       pinStreamingCard: entry.pinStreamingCard === true || undefined,
       // Default ON: only an explicit false is meaningful/persisted (undefined = on).
-      cotEnabled: entry.cotEnabled === false ? false : undefined,
+      cotEnabled: normalizeCotEnabled(entry) ? undefined : false,
       // Default ON, same convention as cotEnabled: an absent key means the
       // <sender> tag is injected, so existing prompts are unchanged.
       senderTag: entry.senderTag === false ? false : undefined,
@@ -3952,4 +3952,9 @@ export function readBotSkillPolicy(raw: unknown): BotSkillPolicy | undefined {
   const include = readDirectSkillSelectors(r.include);
   if (include) out.include = include;
   return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/** Keep persisted pre-rename preferences; an explicit canonical boolean wins. */
+export function normalizeCotEnabled(entry?: { cotEnabled?: unknown; thinkingCard?: unknown }): boolean {
+  return typeof entry?.cotEnabled === 'boolean' ? entry.cotEnabled : entry?.thinkingCard !== false;
 }
