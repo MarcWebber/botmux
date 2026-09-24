@@ -3954,7 +3954,16 @@ export function readBotSkillPolicy(raw: unknown): BotSkillPolicy | undefined {
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
-/** Keep persisted pre-rename preferences; an explicit canonical boolean wins. */
+/**
+ * Read-compat for `thinkingCard`, renamed to `cotEnabled` in #1477 (shipped
+ * v3.27): without this, an explicitly muted thinking bubble silently comes
+ * back after upgrade. An explicit canonical boolean always wins.
+ *
+ * Removal plan: delete together with every site marked
+ * `[legacy-thinkingCard]` (grep `thinkingCard` under src/) no earlier than
+ * v3.33.0 — at least three minor releases after this compat ships. Removing it restores default-on for any un-migrated key, so bump
+ * the floor release if old keys still show up in support.
+ */
 export function normalizeCotEnabled(entry?: { cotEnabled?: unknown; thinkingCard?: unknown }): boolean {
   return typeof entry?.cotEnabled === 'boolean' ? entry.cotEnabled : entry?.thinkingCard !== false;
 }
