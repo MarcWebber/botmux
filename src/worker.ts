@@ -421,6 +421,7 @@ import {
   submitFailureChainKeyOf,
   type SubmitFailureChainKey,
 } from './services/submit-failure-chain.js';
+import { createQueuedActivationReceiptObserver } from './services/queued-activation-receipts.js';
 import { diagnoseSubmitFailure } from './services/submit-failure-diagnosis.js';
 import {
   runAdoptQueuedWriteSequence,
@@ -2361,7 +2362,7 @@ function codexUpgradeBlocked(): string | undefined {
       || pendingMessages.length || pendingRawInputs.length || pendingInjections.length
       || pendingAdoptMessages.length || sessionRenameInFlight() || pendingSessionRename
       || durableTurnInFlight || tuiPromptBlocking || hookReviewInputHold || bareShellCheckInProgress
-      || ambiguousSubmissionRecoveryHold || submitFailureChains.size()
+      || ambiguousSubmissionRecoveryHold || submitFailureChains.size() || queuedActivationReceipts.size()
       || codexAppTurnLiveness.hasActiveTurn() || codexAppCompletionAwaitingFinal
       || codexAppTurnDispatchQueue.size() || codexAppRecoveredDispatches.length
       || hasStructuredLifecycleBlock()) return 'waiting for the current turn and input queues';
@@ -11759,6 +11760,9 @@ let unscopedSubmitFailureChainSequence = 0;
  *  instead of stacking a second one, so a logical submission/attempt can never
  *  produce two overlapping chains (and thus two submit_unconfirmed warnings). */
 const submitFailureChains = createSubmitFailureChainController();
+// A warning settles its bounded notification chain, but cannot abandon the
+// daemon's durable activation journal. Keep observing only the original receipt.
+const queuedActivationReceipts = createQueuedActivationReceiptObserver(SUBMIT_DEFERRED_RECHECK_MS);
 
 /**
  * A recovery fence failure means the prompt may already be running. Keep its
@@ -11821,7 +11825,7 @@ function scheduleSubmitFailureNotify(
   bridgeTurnId?: string,
   failureReason?: string,
   turnSeq = usageLimitTracker.currentTurn(),
-  turnIdentity?: Pick<PendingCliInput, 'turnId' | 'dispatchAttempt' | 'nativeSessionTitle'>,
+  turnIdentity?: Pick<PendingCliInput, 'turnId' | 'dispatchAttempt' | 'nativeSessionTitle' | 'queuedActivationToken'>,
   durableTerminalStatus: 'failed' | 'ambiguous' = 'failed',
   structuredTarget = false,
   onConfirmed?: (cliSessionId?: string) => void,
@@ -11985,13 +11989,15 @@ function scheduleSubmitFailureNotify(
         message: t(
           effectiveBackendType === 'zmx'
             ? 'worker.submit_unconfirmed_zmx'
-            : submitDiagnosis.reason === 'logged_out'
-              ? 'submitDiag.logged_out'
-              : submitDiagnosis.reason === 'interactive_menu'
-                ? 'submitDiag.interactive_menu'
-                : submitDiagnosis.reason === 'draft_parked'
-                  ? 'submitDiag.draft_parked'
-                  : 'worker.submit_unconfirmed',
+            : turnIdentity?.queuedActivationToken && recheck
+              ? 'worker.activation_submit_unconfirmed'
+              : submitDiagnosis.reason === 'logged_out'
+                ? 'submitDiag.logged_out'
+                : submitDiagnosis.reason === 'interactive_menu'
+                  ? 'submitDiag.interactive_menu'
+                  : submitDiagnosis.reason === 'draft_parked'
+                    ? 'submitDiag.draft_parked'
+                    : 'worker.submit_unconfirmed',
           {
             cliName: cliName(),
             secs: Math.round(SUBMIT_DEFERRED_RECHECK_MS / 1000),
@@ -12127,6 +12133,39 @@ function requeueUnsubmittedQueuedActivation(item: PendingCliInput): void {
     pendingMessages.unshift(item);
   }
   log(`Retained queued activation ${item.queuedActivationToken.substring(0, 8)} for retry`);
+}
+
+function acknowledgeQueuedActivation(item: PendingCliInput): void {
+  if (!item.queuedActivationToken) return;
+  queuedActivationReceipts.cancel(item.queuedActivationToken);
+  send({
+    type: 'queued_activation_submitted',
+    sessionId,
+    activationToken: item.queuedActivationToken,
+  });
+}
+
+function observeQueuedActivationReceipt(
+  item: PendingCliInput,
+  recheck: () => SubmitRecheckResult | Promise<SubmitRecheckResult>,
+): void {
+  if (!item.queuedActivationToken || !backend) return;
+  const generation = cliSpawnGeneration;
+  const receiptBackend = backend;
+  queuedActivationReceipts.watch(item.queuedActivationToken, {
+    recheck,
+    isCurrent: () => cliSpawnGeneration === generation
+      && backend === receiptBackend && !cliRestartInProgress,
+    onConfirmed: result => {
+      if (typeof result === 'object' && result.cliSessionId) {
+        persistCliSessionId(result.cliSessionId);
+        if (codexBridgeFallbackActive()) codexBridgeNotifyCliSessionId(result.cliSessionId);
+        void syncFreshCodexNativeSessionTitle(result.cliSessionId, codexRpcEngine);
+      }
+      queuePostSubmitNativeSessionTitle(item.nativeSessionTitle);
+      acknowledgeQueuedActivation(item);
+    },
+  });
 }
 
 function codexAppRuntimeTypeAheadReady(): boolean {
@@ -12978,17 +13017,22 @@ async function flushPending(): Promise<void> {
             item,
             'failed',
           );
+          if (!result.failureReason && result.recheck) {
+            observeQueuedActivationReceipt(item, result.recheck);
+          }
         }
-        if (!recoveryFailureReason) requeueUnsubmittedQueuedActivation(item);
+        // A missing history receipt is ambiguous, not proof that the input was
+        // untouched. Replaying on every idle probe duplicates slow submissions
+        // and continually replaces their deferred confirmation timer. Only the
+        // adapter's explicit safe non-submission disposition permits retry.
+        if (!recoveryFailureReason && codexAppSafeNonSubmission) {
+          requeueUnsubmittedQueuedActivation(item);
+        }
       } else if (item.queuedActivationToken) {
         // The daemon keeps the exact journal and route reservation until this
         // adapter-level boundary. IPC loss may replay at-least-once; an early
         // worker/daemon crash can never silently consume the opening turn.
-        send({
-          type: 'queued_activation_submitted',
-          sessionId,
-          activationToken: item.queuedActivationToken,
-        });
+        acknowledgeQueuedActivation(item);
       }
       if (queuedPostSubmitNativeTitle) break;
       // All structured bridges now drain every pending message in one flush:
@@ -13519,7 +13563,12 @@ function canCaptureBusyPatternScreen(be: Pick<SessionBackend, 'captureCurrentScr
 
 function deferPromptReadyWhileBusy(source: string, be: SessionBackend): boolean {
   const currentCliSid = lastSpawnEffectiveCliSessionId ?? lastInitConfig?.cliSessionId;
-  if (cliAdapter?.isSessionBusy && cliAdapter.isSessionBusy({ sessionId, cliSessionId: currentCliSid })) {
+  if (cliAdapter?.isSessionBusy && cliAdapter.isSessionBusy({
+    sessionId,
+    cliSessionId: currentCliSid,
+    getCurrentScreen: backendScreenEvidenceIsAuthoritativeForMutation()
+      ? () => captureBackendScreen(be) : undefined,
+  })) {
     log(`${source}: session state indicates active work (db busy); deferring prompt ready`);
     idleDetector?.reset();
     scheduleBusyPatternIdleProbe(source);
@@ -13544,7 +13593,12 @@ function probeBusyPatternIdle(
   be: SessionBackend,
 ): boolean {
   const currentCliSid = lastSpawnEffectiveCliSessionId ?? lastInitConfig?.cliSessionId;
-  if (cliAdapter?.isSessionBusy && cliAdapter.isSessionBusy({ sessionId, cliSessionId: currentCliSid })) {
+  if (cliAdapter?.isSessionBusy && cliAdapter.isSessionBusy({
+    sessionId,
+    cliSessionId: currentCliSid,
+    getCurrentScreen: backendScreenEvidenceIsAuthoritativeForMutation()
+      ? () => captureBackendScreen(be) : undefined,
+  })) {
     return false;
   }
   if (cliAdapter?.busyPattern) {
@@ -13666,6 +13720,7 @@ async function spawnCli(
   // Deferred submit-failure chains are generation-keyed; a fresh generation
   // invalidates every live chain before any old timer can touch new state.
   submitFailureChains.clear();
+  queuedActivationReceipts.clear();
   // Experimental external App Server attachment: BotMux owns only this TUI
   // client, never the server or its JSON-RPC input stream. Re-establish the
   // remote argv state on EVERY spawn because killCli() deliberately clears the
@@ -18013,6 +18068,7 @@ async function restartCliProcess(
   // Old-generation deferred submit rechecks are stale by definition: cancel
   // them now so no lingering timer warns or mutates the replacement attempt.
   submitFailureChains.clear();
+  queuedActivationReceipts.clear();
   // Set before touching destroySession(): remote teardown can await for many
   // seconds while the old backend object is still non-null and still capable
   // of firing idle/task-done callbacks. Inputs accepted in that interval must
