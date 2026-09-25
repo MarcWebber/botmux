@@ -3531,7 +3531,7 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
     setStatusKey(key);
     try {
       const res = await putCardPref(patch);
-      setStatus(res.ok ? { text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true } : { text: `✗ ${responseErrorText(res)}` });
+      setStatus(res.ok ? { text: `✓ ${tr('botDefaults.cardPrefSaved')}`, ok: true } : { text: `✗ ${res.body?.error === 'invalid_auto_start_excluded_chats' ? tr('botDefaults.autoStartExcludedChatsInvalid') : responseErrorText(res)}` });
     } catch (e: any) {
       setStatus({ text: `✗ ${caughtErrorText(e)}` });
     } finally {
@@ -3546,8 +3546,10 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
       {showExcluded && <div className="bd-row"><label>
         {tr('botDefaults.autoStartExcludedChatsHelp')}
         <textarea data-input="autoStartExcludedChats" rows={3} value={excluded} placeholder={'oc_xxx\noc_yyy'} onChange={e => setExcluded(e.currentTarget.value)} />
-        <button type="button" data-action="save-auto-start-exclusions" disabled={busy === 'excluded'} onClick={() => void savePatch({ autoStartExcludedChats: excluded.split(/\r?\n/).map(id => id.trim()).filter(Boolean) }, 'excluded')}>{tr('common.save')}</button>
-      </label></div>}
+      </label><div className="actions">
+        <button type="button" data-action="save-auto-start-exclusions" disabled={busy === 'excluded'} onClick={() => void savePatch({ autoStartExcludedChats: excluded.split(/\r?\n/).map(id => id.trim()).filter(Boolean) }, 'excluded')}>{tr('botDefaults.save')}</button>
+        {statusKey === 'excluded' && <StatusSpan status={status} />}
+      </div></div>}
       <ToggleRow
         checked={inviteOwner}
         disabled={busy === 'inviteOwner'}
@@ -3618,7 +3620,7 @@ export function AutoStartControls(props: { bot: BotDefaultsRow; putCardPref(patc
             {tr('botDefaults.autoStartJoinSeedReset')}
           </button>
         ) : null}
-        {statusKey?.startsWith('joincmd') ? null : <StatusSpan status={status} attr={{ 'data-auto-start-status': '' }} />}
+        {statusKey === 'excluded' || statusKey?.startsWith('joincmd') ? null : <StatusSpan status={status} attr={{ 'data-auto-start-status': '' }} />}
       </div>
       <ToggleRow
         checked={joinCmdOn}
