@@ -67,6 +67,7 @@
     "prepare": "git config core.hooksPath scripts/git-hooks 2>/dev/null || true"
   },
   "dependencies": {
+    "@a2a-js/sdk": "1.2.1",
     "@larksuiteoapi/node-sdk": "^1.64.0",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "@xterm/addon-unicode11": "^0.9.0",

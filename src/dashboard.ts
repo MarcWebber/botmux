@@ -102,6 +102,7 @@ import {
   type WorkflowDaemonIpcTarget,
 } from './workflows/v3/daemon-ipc-auth.js';
 import { handleDashboardTriggerApi } from './dashboard/trigger-api.js';
+import { handleA2A } from './dashboard/a2a-api.js';
 import { REPLY_STYLE_REQUEST_MAX_BYTES } from './dashboard/reply-style.js';
 import { ASK_OPTION_LAYOUT_REQUEST_MAX_BYTES } from './im/lark/ask-option-layout.js';
 import { handleConnectorApi } from './dashboard/connector-api.js';
@@ -3765,6 +3766,8 @@ const server = createServer(async (req, res) => {
       res.writeHead(200, { 'content-type': 'text/plain' });
       return res.end(DASHBOARD_SELF_NONCE);
     }
+
+    if (url.pathname.startsWith('/a2a/')) return handleA2A(req, res, url, { loadBotConfigs, proxyToDaemon });
 
     // Closed companion surface: it buffers bodies only for this exact prefix,
     // before the ordinary Dashboard auth/router touches the request stream.

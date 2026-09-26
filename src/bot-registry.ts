@@ -1433,6 +1433,7 @@ export interface BotConfig {
    * 缺省 / false 保持原有飞书 bot 行为字节不变。
    */
   apiOnly?: boolean;
+  a2a?: { enabled: boolean; tokenEnv: string };
   /** Final-answer feedback policy. Missing/disabled is intentionally inert. */
   feedback?: FeedbackPolicyInput | FeedbackPolicy;
   oncallGroup?: OncallGroupPolicy;
@@ -3782,6 +3783,8 @@ export function parseBotConfigsFromText(jsonText: string): BotConfig[] {
       larkAppSecret: entry.larkAppSecret ?? '',
       apiOnly: entry.apiOnly === true || undefined,
       oncallGroup: entry.oncallGroup === undefined ? undefined : normalizeOncallGroupPolicy(entry.oncallGroup),
+      a2a: entry.a2a?.enabled === true && typeof entry.a2a.tokenEnv === 'string' && entry.a2a.tokenEnv.trim()
+        ? { enabled: true, tokenEnv: entry.a2a.tokenEnv.trim() } : undefined,
       feedback: entry.feedback === undefined
         ? undefined
         : normalizeFeedbackPolicyLayer(entry.feedback),

@@ -11,9 +11,15 @@
  * Run:  pnpm vitest run test/trigger-session-idempotency-e2e.test.ts
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
+import type { BotConfig } from '../src/bot-registry.js';
+import { handleA2A } from '../src/dashboard/a2a-api.js';
+import { resolveAsyncTriggerState } from '../src/services/async-trigger-state.js';
+import { buildSessionMessagePreview } from '../src/core/session-message-preview.js';
 import type { TriggerRequest } from '../src/services/trigger-types.js';
 
 let tempDir: string;
@@ -120,6 +126,72 @@ afterEach(() => {
 });
 
 describe('triggerSessionTurn — idempotency dispatch (real stores)', () => {
+  it('A2A HTTP retries reuse real persisted tasks across first messages and follow-ups', async () => {
+    const activeSessions = new Map<string, any>();
+    const priorToken = process.env.TEST_A2A_INTEGRATION_TOKEN;
+    process.env.TEST_A2A_INTEGRATION_TOKEN = 'integration-token';
+    const deps = {
+      loadBotConfigs: () => [{ larkAppId: APP, a2a: { enabled: true, tokenEnv: 'TEST_A2A_INTEGRATION_TOKEN' } } as BotConfig],
+      proxyToDaemon: async (_bot: string, path: string, init: RequestInit) => {
+        if (path === '/api/trigger') return Response.json(await triggerSessionTurn(JSON.parse(String(init.body)), { larkAppId: APP, activeSessions }));
+        const url = new URL(path, 'http://localhost');
+        const sessionId = url.pathname.split('/')[3];
+        const triggerId = url.searchParams.get('triggerId')!;
+        const result = resolveAsyncTriggerState({ sessionId, requestedTriggerId: triggerId, liveActive: false,
+          persisted: asyncTriggerStore.lookup(sessionId, triggerId), storedStatus: 'open' });
+        return Response.json(result, { status: result.errorCode === 'bad_request' ? 400 : 200 });
+      },
+    };
+    const server = createServer((req, res) => { void handleA2A(req, res, new URL(req.url!, 'http://localhost'), deps).catch(error => { res.writeHead(500); res.end(String(error)); }); });
+    try {
+      await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+      const call = async (method: string, params: unknown) => {
+        const response = await fetch(`http://127.0.0.1:${(server.address() as AddressInfo).port}/a2a/${APP}`, {
+          method: 'POST', headers: { authorization: 'Bearer integration-token', 'a2a-version': '1.0', 'content-type': 'application/json' },
+          body: JSON.stringify({ jsonrpc: '2.0', id: 'http-attempt', method, params }),
+        });
+        return await response.json() as any;
+      };
+      const firstMessage = { message: { messageId: 'first-message', role: 'ROLE_USER', parts: [{ text: 'first task' }] }, configuration: { returnImmediately: true } };
+      const first = (await call('SendMessage', firstMessage)).result.task;
+      expect(mockForkWorker).toHaveBeenCalledTimes(1);
+      expect((await call('GetTask', { id: first.id })).result.status.state).toBe('TASK_STATE_WORKING');
+      const firstTrigger = first.id.split(':')[1];
+      asyncTriggerStore.recordCompleted(first.contextId, firstTrigger, 'first answer', Date.now(), APP);
+      const previewSession = { ...createdSessions[0], larkAppId: APP };
+      expect(buildSessionMessagePreview(previewSession)).toMatchObject({ previewBotFullText: 'first answer', previewBotState: 'replied' });
+      // The first receipt could have been lost: sending it again must read the original result.
+      const recovered = (await call('SendMessage', firstMessage)).result.task;
+      expect(recovered.id).toBe(first.id);
+      expect(recovered.status.state).toBe('TASK_STATE_COMPLETED');
+      expect(mockForkWorker).toHaveBeenCalledTimes(1);
+      const followupMessage = { ...firstMessage, message: { ...firstMessage.message, messageId: 'followup', contextId: first.contextId, parts: [{ text: 'next task' }] } };
+      const followup = (await call('SendMessage', followupMessage)).result.task;
+      expect(followup.contextId).toBe(first.contextId); expect(followup.id).not.toBe(first.id);
+      expect(buildSessionMessagePreview(previewSession).previewBotFullText).toBeUndefined();
+      const completedAt = Date.now();
+      asyncTriggerStore.recordCompleted(followup.contextId, followup.id.split(':')[1], 'second answer\n第二行 🧪', completedAt, APP);
+      expect(buildSessionMessagePreview(previewSession).previewBotFullText).toBe('second answer\n第二行 🧪');
+      expect(buildSessionMessagePreview({ ...previewSession, larkAppId: 'other-bot' }).previewBotFullText).toBeUndefined();
+      expect(buildSessionMessagePreview({ ...previewSession, status: 'closed' }).previewBotFullText).toBeNull();
+      mkdirSync(join(tempDir, 'turn-sends'));
+      const sendFile = join(tempDir, 'turn-sends', `${first.contextId}.jsonl`);
+      writeFileSync(sendFile, JSON.stringify({ previewText: 'older chat answer', sentAtMs: completedAt - 1000 }) + '\n');
+      expect(buildSessionMessagePreview(previewSession).previewBotFullText).toBe('second answer\n第二行 🧪');
+      writeFileSync(sendFile, JSON.stringify({ previewText: 'newer chat answer', sentAtMs: completedAt + 1000 }) + '\n');
+      expect(buildSessionMessagePreview(previewSession).previewBotFullText).toBe('newer chat answer');
+      expect((await call('SendMessage', followupMessage)).result.task.id).toBe(followup.id);
+      expect(mockForkWorker).toHaveBeenCalledTimes(2);
+      expect((await call('GetTask', { id: first.id })).result.artifacts[0].parts[0].text).toBe('first answer');
+      expect((await call('GetTask', { id: `${first.contextId}:trg_missing` })).error.code).toBe(-32001);
+      const conflict = await call('SendMessage', { ...followupMessage, message: { ...followupMessage.message, parts: [{ text: 'changed task' }] } });
+      expect(conflict.error).toBeDefined(); expect(mockForkWorker).toHaveBeenCalledTimes(2);
+    } finally {
+      await new Promise<void>(resolve => server.close(() => resolve()));
+      if (priorToken === undefined) delete process.env.TEST_A2A_INTEGRATION_TOKEN; else process.env.TEST_A2A_INTEGRATION_TOKEN = priorToken;
+    }
+  });
+
   it('first call: forks once, writes a reserved→attempting lease, returns idempotent:false', async () => {
     const res = await triggerSessionTurn(freshAsyncReq('k-1'), { larkAppId: APP, activeSessions: new Map() });
     expect(res.ok).toBe(true);

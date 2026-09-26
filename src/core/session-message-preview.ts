@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { config } from '../config.js';
 import type { Session } from '../types.js';
 import { BoundedMap } from '../utils/bounded-map.js';
+import { lookup as lookupAsyncTrigger } from '../services/async-trigger-store.js';
 
 const PREVIEW_TAIL_BYTES = 64 * 1024;
 const PREVIEW_TAIL_ROWS = 40;
@@ -159,8 +160,8 @@ function safeJsonlKey(value: unknown): string | undefined {
  * Build the latest user/bot exchange shown on dashboard session cards.
  *
  * User text comes from the local inbound queue (with persisted lastUserPrompt
- * as a fallback). Bot text comes from the append-only turn-sends marker written
- * by `botmux send`. Both reads are bounded and best-effort so a corrupt marker
+ * as a fallback). Bot text uses the newer of the chat send marker and the
+ * latest completed async result. Reads are best-effort so corrupt records
  * cannot break `/api/sessions`.
  */
 export function buildSessionMessagePreview(session: Session): SessionMessagePreview {
@@ -182,12 +183,19 @@ export function buildSessionMessagePreview(session: Session): SessionMessagePrev
     : undefined;
 
   const safeSessionId = safeJsonlKey(session.sessionId);
-  const latestBot = safeSessionId
+  let latestBot = safeSessionId
     ? readLatestJsonlRow(
         join(config.session.dataDir, 'turn-sends', `${safeSessionId}.jsonl`),
         'bot',
       )
     : undefined;
+
+  const asyncReply = safeSessionId && session.larkAppId ? lookupAsyncTrigger(safeSessionId) : undefined;
+  const asyncResult = asyncReply?.ownerLarkAppId === session.larkAppId ? asyncReply?.result : undefined;
+  if (asyncResult?.status === 'completed' && typeof asyncResult.content === 'string'
+      && (numberOrUndefined(asyncResult.completedAt) ?? 0) > (numberOrUndefined(latestBot?.sentAtMs) ?? 0)) {
+    latestBot = { previewText: asyncResult.content, sentAtMs: asyncResult.completedAt };
+  }
 
   const userFullText = compactMultiline(
     latestUser?.content ?? session.lastUserPrompt ?? '',
