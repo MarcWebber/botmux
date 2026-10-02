@@ -156,6 +156,8 @@ describe('triggerSessionTurn — idempotency dispatch (real stores)', () => {
       const first = (await call('SendMessage', firstMessage)).result.task;
       expect(mockForkWorker).toHaveBeenCalledTimes(1);
       expect((await call('GetTask', { id: first.id })).result.status.state).toBe('TASK_STATE_WORKING');
+      // This fixture has no live Worker: a failed retry receipt must not become working.
+      expect((await call('SendMessage', firstMessage)).result.task.status.state).toBe('TASK_STATE_FAILED');
       const firstTrigger = first.id.split(':')[1];
       asyncTriggerStore.recordCompleted(first.contextId, firstTrigger, 'first answer', Date.now(), APP);
       const previewSession = { ...createdSessions[0], larkAppId: APP };
@@ -186,6 +188,16 @@ describe('triggerSessionTurn — idempotency dispatch (real stores)', () => {
       expect((await call('GetTask', { id: `${first.contextId}:trg_missing` })).error.code).toBe(-32001);
       const conflict = await call('SendMessage', { ...followupMessage, message: { ...followupMessage.message, parts: [{ text: 'changed task' }] } });
       expect(conflict.error).toBeDefined(); expect(mockForkWorker).toHaveBeenCalledTimes(2);
+      for (const contextId of [undefined, first.contextId]) {
+        const message = { ...firstMessage, message: { ...firstMessage.message, messageId: `interrupt-${contextId ?? 'new'}`, contextId } };
+        const task = (await call('SendMessage', message)).result.task;
+        const dispatched = mockForkWorker.mock.calls.length;
+        asyncTriggerStore.recordInterruptedStrict(task.contextId, task.id.split(':')[1], Date.now(), APP);
+        const canceled = (await call('GetTask', { id: task.id })).result;
+        expect(canceled).toMatchObject({ id: task.id, contextId: task.contextId, status: { state: 'TASK_STATE_CANCELED' } });
+        expect((await call('SendMessage', message)).result.task).toEqual(canceled);
+        expect(mockForkWorker).toHaveBeenCalledTimes(dispatched);
+      }
     } finally {
       await new Promise<void>(resolve => server.close(() => resolve()));
       if (priorToken === undefined) delete process.env.TEST_A2A_INTEGRATION_TOKEN; else process.env.TEST_A2A_INTEGRATION_TOKEN = priorToken;

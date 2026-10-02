@@ -1,6 +1,6 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { createHash, timingSafeEqual } from 'node:crypto';
-import { AgentCard, Message, Role, Task } from '@a2a-js/sdk';
+import { AgentCard, Message, Role, Task, TaskState } from '@a2a-js/sdk';
 import { JsonRpcTransportHandler, ServerCallContext, validateVersion, type A2ARequestHandler } from '@a2a-js/sdk/server';
 import { ContentTypeNotSupportedError, InvalidAgentResponseError, PushNotificationNotSupportedError, RequestMalformedError, TaskNotFoundError, UnsupportedOperationError, toJsonRpcError } from '@a2a-js/sdk/errors';
 import type { BotConfig } from '../bot-registry.js';
@@ -18,9 +18,9 @@ function taskResult(result: TriggerResponse, sessionId = result.target?.sessionI
     if (['bad_request', 'idempotency_conflict', 'session_not_found'].includes(result.errorCode ?? '')) throw new RequestMalformedError(result.error);
     throw new Error(result.error ?? 'Botmux request failed');
   }
-  const state = result.state ?? (result.ok && result.action === 'queued' ? 'submitted' : undefined);
+  const state = result.state === 'interrupted' ? 'canceled' : result.state ?? (result.ok && result.action === 'queued' ? 'submitted' : undefined);
   if (!sessionId || !triggerId) throw new InvalidAgentResponseError('Botmux did not return a task ID');
-  if (!state || !['submitted', 'running', 'completed', 'failed'].includes(state)) throw new InvalidAgentResponseError('Unknown Botmux task state');
+  if (!state || !['submitted', 'running', 'completed', 'failed', 'canceled'].includes(state)) throw new InvalidAgentResponseError('Unknown Botmux task state');
   if (result.output?.content !== undefined && typeof result.output.content !== 'string') throw new InvalidAgentResponseError('Invalid Botmux text result');
   const id = `${sessionId}:${triggerId}`;
   return Task.fromJSON({ id, contextId: sessionId,
@@ -79,8 +79,10 @@ export async function handleA2A(req: IncomingMessage, res: ServerResponse, url: 
       }, deps);
       if (status >= 400 && result.ok) throw new InvalidAgentResponseError(`Botmux submit failed (${status})`);
       const task = taskResult(result);
-      // A duplicate dispatch receipt may still say queued after the task has completed.
-      return result.idempotent && result.state !== 'failed' ? getTask({ id: task.id }) : task;
+      if (!result.idempotent) return task;
+      const current = await getTask({ id: task.id });
+      // Keep failed receipts terminal unless the task confirms cancellation.
+      return result.state === 'failed' && current.status?.state !== TaskState.TASK_STATE_CANCELED ? task : current;
     },
     getAuthenticatedExtendedAgentCard: unsupported, sendMessageStream: unsupported, resubscribe: unsupported,
     cancelTask: unsupported, listTasks: unsupported,

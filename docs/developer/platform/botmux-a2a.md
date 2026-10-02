@@ -48,7 +48,7 @@
 }
 ```
 
-查询结果位于 `result`：`status.state` 为 `TASK_STATE_WORKING` 时继续等待，完成后从 `artifacts[].parts[].text` 读取文字。失败返回 `TASK_STATE_FAILED` 和原因；本次查询断线或请求错误不代表任务失败。
+查询结果位于 `result`：`status.state` 为 `TASK_STATE_WORKING` 时继续等待，完成后从 `artifacts[].parts[].text` 读取文字。失败返回 `TASK_STATE_FAILED` 和原因。在 Botmux 侧中断任务后，返回 `TASK_STATE_CANCELED`；原样重发仍返回原任务的已取消状态，不会重新执行。本次查询断线或请求错误不代表任务失败。
 
 ## 追问与重试
 
