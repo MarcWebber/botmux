@@ -103,6 +103,7 @@ import {
 } from './workflows/v3/daemon-ipc-auth.js';
 import { handleDashboardTriggerApi } from './dashboard/trigger-api.js';
 import { REPLY_STYLE_REQUEST_MAX_BYTES } from './dashboard/reply-style.js';
+import { ASK_OPTION_LAYOUT_REQUEST_MAX_BYTES } from './im/lark/ask-option-layout.js';
 import { handleConnectorApi } from './dashboard/connector-api.js';
 import {
   projectSessionEventForAudience,
@@ -181,9 +182,10 @@ import { WORKBENCH_DOCK_IMMERSIVE_HASH, WORKBENCH_IMMERSIVE_HASH } from './core/
 import { resolveBotmuxDataDir } from './core/data-dir.js';
 import { parseCloseResidual, type ParsedCloseResidual } from './core/close-residual.js';
 import { dashboardSecretPath } from './core/dashboard-secret.js';
-import { getGitRepoInfo } from './core/session-row-enrichment.js';
+import type { WorkspaceMetadata } from './core/workspace-metadata.js';
 import { deleteWhiteboard, listWhiteboards, readWhiteboard, whiteboardEnabled } from './services/whiteboard-store.js';
 import { isLocalDevInstall, botmuxVersion, botmuxVersionAt, diskVersionAt, botmuxCliEntry, botmuxCliEntryAt, botmuxInstallRoot, bakedBinaryVersion } from './utils/install-info.js';
+import { formatRunningDaemonsRestartSummary } from './utils/daemon-version-display.js';
 import { checkNode, detectBotmuxInstalls, resolveCurrentVersion, resolveCurrentVersionAt } from './utils/install-diagnostics.js';
 import {
   fetchLatestVersion,
@@ -816,7 +818,17 @@ const terminalFrontProxy = createTerminalFrontProxy({
   // worker port or the daemon's own `/s/` proxy is refused by the worker.
   viewCapabilityForwardProof: viewToken => terminalViewForwardProof(SECRET, viewToken),
 });
-const sessionPresentation = createSessionPresentationCoordinator(aggregator, getGitRepoInfo);
+const sessionPresentation = createSessionPresentationCoordinator(aggregator, async () => null,
+  async (appId, row, options) => {
+    const daemon = registry.getByAppId(appId);
+    if (!daemon) return null;
+    const response = await fetchDaemonIpc(daemon.ipcPort,
+      `/api/sessions/${encodeURIComponent(String(row.sessionId))}/workspace${options.force ? '?force=1' : ''}`,
+      { signal: AbortSignal.timeout(10_000) });
+    if (!response.ok) return null; // Older daemons remain usable without metadata.
+    const body = await response.json() as { workingDir?: string; workspace?: WorkspaceMetadata };
+    return body.workingDir === row.workingDir ? body.workspace ?? null : null;
+  });
 const groupsMatrixSnapshot = createGroupsMatrixSnapshot(buildGroupsMatrix, {
   onRefreshError: error => logger.warn(`[dashboard] groups matrix refresh failed: ${String(error)}`),
 });
@@ -1108,6 +1120,8 @@ interface ResolvedDashboardSettings {
     olderThanHours: SessionCleanupHours;
     intervalMinutes: number;
   };
+  /** Machine-wide multi-topic orchestration switch. Default ON. */
+  multiTopic: { enabled: boolean };
   /** 远程访问: emit central-platform URLs (terminals / cards / webhooks) instead
    *  of local host:port. Off by default; only meaningful when bound. */
   remoteAccess: boolean;
@@ -1693,6 +1707,7 @@ function resolveDashboardSettings(): ResolvedDashboardSettings {
       olderThanHours: resolveCleanupHours(global.sessionCleanup),
       intervalMinutes: resolveCleanupIntervalMs(global.sessionCleanup) / 60_000,
     },
+    multiTopic: { enabled: global.multiTopic?.enabled !== false }, // default ON
     remoteAccess: global.remoteAccess === true,
     oauthRedirectBase: global.oauthRedirectBase ?? null,
     scheduleTimeZone: global.scheduleTimeZone ?? null,
@@ -2904,6 +2919,9 @@ async function configuredBotDefaultsRecoveryRows(
           larkBotName: persistedNames.get(bot.larkAppId) ?? null,
           quotaFallbackBot: rawEntry?.quotaFallbackBot,
           autoInviteOwnerOnGroupAdd: rawEntry?.autoInviteOwnerOnGroupAdd,
+          // 离线行也要带上磁盘里的排版配置，否则 daemon 不在线时 Dashboard
+          // 会把已配置的竖放布局显示回 compact（payload 层 fail-soft 归一化）。
+          askOptionLayout: rawEntry?.askOptionLayout,
         });
         return {
           ...payload,
@@ -3074,6 +3092,25 @@ async function transferTeamGroupOwner(args: {
   } catch {
     return { ownerTransferredTo: null, transferError: 'owner_transfer_proxy_failed' };
   }
+}
+
+/** Dashboard has no daemon-local BotRegistry. Resolve personal feed-group
+ * credentials against the matching daemon's live allowlist, then fall back to
+ * this app's configured owner when no open_id is available, matching daemon
+ * feed-group calls. A resolved owner takes precedence over a removed one. */
+function withFeedGroupOwner(bot: BotConfig): BotConfig {
+  const allowed = registry.getByAppId(bot.larkAppId)?.resolvedAllowedUsers ?? [];
+  const ownerOpenId = bot.ownerOpenId && allowed.includes(bot.ownerOpenId)
+    ? bot.ownerOpenId
+    : (allowed.find(id => id.startsWith('ou_')) ?? bot.ownerOpenId);
+  if (!ownerOpenId) {
+    throw new FeedGroupApiError(
+      '无法确认该机器人的负责人，请确认机器人已上线且管理员身份解析成功。',
+      'feed_group_owner_unresolved',
+      409,
+    );
+  }
+  return { ...bot, ownerOpenId };
 }
 
 function lifecycleBotIds(connector: ConnectorDefinition): string[] {
@@ -3653,7 +3690,12 @@ const companionApi = (() => {
   const requireBoundBot = () => {
     const matches = readBotsJsonOrEmpty(BOTS_JSON_PATH).filter((entry) => entry?.larkAppId === appId);
     const bot = matches.length === 1 ? matches[0] : undefined;
-    if (!bot || bot.sandbox !== true || (bot.cliId !== 'codex' && bot.cliId !== 'traex')) {
+    // Companion binding REQUIRES a credential-isolating oncall sandbox (the
+    // companion's whole premise is running with the bot's masked transport
+    // credential). scratch is write-integrity COW without a read/secret
+    // boundary, so it is deliberately NOT accepted here — the CLI-side gate
+    // (companion-startup-options) rejects it too; keep both gates identical.
+    if (!bot || !(bot.sandbox === true || bot.sandbox === 'oncall') || (bot.cliId !== 'codex' && bot.cliId !== 'traex')) {
       throw new Error('companion_bound_bot_invalid');
     }
     return bot;
@@ -4604,11 +4646,28 @@ const server = createServer(async (req, res) => {
         lastCheckedAt: entry.lastCheckedAt,
       }));
       const localDev = isLocalDevInstall();
+      const runningDaemons = registry.list().map(d => ({
+        larkAppId: d.larkAppId,
+        version: d.botmuxVersion,
+      }));
+      // In the compiled binary `current` is this dashboard process's OWN baked
+      // version (install-info.ts: bakedBinaryVersion shadows the install tree),
+      // not what install.sh last put on disk, so "running daemon vs disk" is
+      // undetermined there — say nothing rather than invert after a partial
+      // respawn. A Node install reads package.json, which is the disk.
+      const diskVersion = isStandaloneBinary() ? undefined : current;
+      const runningDaemonRestartHint = formatRunningDaemonsRestartSummary(
+        runningDaemons.map(d => d.version),
+        diskVersion,
+      );
       return jsonRes(res, 200, {
         current,
+        ...(diskVersion ? { diskVersion } : {}),
         latest,
         versionLookupOk: latestResult.lookupOk,
         behind: !!latest && isNewerVersion(latest, current),
+        runningDaemons,
+        ...(runningDaemonRestartHint ? { runningDaemonRestartHint } : {}),
         cliBehind: cliUpdates.some((entry) => entry.updateAvailable),
         cliUpdates,
         localDevInstall: localDev,
@@ -5392,7 +5451,18 @@ const server = createServer(async (req, res) => {
     // ─── Customization center (built-in prompt/skill overrides) ──────────────
     // GET is a public read (overview only, no secrets); all mutations are
     // owner-gated (not on PUBLIC_READ_PATHS → decideDashboardAuth 401s guests).
-    if (await handleCustomizationApi(req, res, url)) {
+    if (await handleCustomizationApi(req, res, url, {
+      getBotNames: () => {
+        const names = readPersistedBotNames();
+        for (const bot of registry.list()) {
+          const name = bot.botName?.trim();
+          // A daemon can publish its App ID while the Feishu probe warms up.
+          // Keep a known cached name until a real live name is available.
+          if (name && name !== bot.larkAppId) names.set(bot.larkAppId, name);
+        }
+        return names;
+      },
+    })) {
       return;
     }
 
@@ -5800,7 +5870,7 @@ const server = createServer(async (req, res) => {
 
     // 看板放置 / 重命名 / 锁定：带 JSON body 的会话写操作，原样转发给 owner daemon。
     // 不在公开读白名单内 → 只读访客在 decideDashboardAuth 已被 401。
-    if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/(board|rename|lock)$/))) {
+    if (req.method === 'POST' && (m = url.pathname.match(/^\/api\/sessions\/([^/]+)\/(board|rename|lock|live-stage)$/))) {
       const sid = decodeURIComponent(m[1]); const op = m[2];
       const owner = aggregator.ownerOf(sid);
       if (!owner) return jsonRes(res, 404, { ok: false, error: 'unknown_session' });
@@ -7064,6 +7134,32 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    // PUT /api/bots/:appId/ask-option-layout — proxy the per-bot ask option
+    // layout to the target bot's daemon. The daemon owns validation, atomic
+    // bots.json persistence, and its in-memory config update; ask cards render
+    // in the daemon process, so the change is visible on the next card.
+    let mBotAskOptionLayout: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotAskOptionLayout = url.pathname.match(/^\/api\/bots\/([^/]+)\/ask-option-layout$/))) {
+      const appId = decodeURIComponent(mBotAskOptionLayout[1]);
+      let raw: string;
+      try {
+        raw = JSON.stringify(await readJsonBody(req, ASK_OPTION_LAYOUT_REQUEST_MAX_BYTES));
+      } catch (err) {
+        const status = err instanceof DashboardJsonBodyTooLargeError ? 413 : 400;
+        res.writeHead(status, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: status === 413 ? 'body_too_large' : 'bad_json' }));
+        return;
+      }
+      const upstream = await proxyToDaemon(appId, `/api/bot-ask-option-layout`, {
+        method: 'PUT',
+        headers: { 'content-type': 'application/json' },
+        body: raw,
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // PUT /api/bots/:appId/startup-commands — proxy to that bot's daemon. Body
     // `{ startupCommands: string }` (raw text, comma/newline separated; '' = clear).
     let mBotStartup: RegExpMatchArray | null;
@@ -7519,6 +7615,20 @@ const server = createServer(async (req, res) => {
       return;
     }
 
+    let mBotPromptInjection: RegExpMatchArray | null;
+    if (req.method === 'PUT' && (mBotPromptInjection = url.pathname.match(/^\/api\/bots\/([^/]+)\/prompt-injection$/))) {
+      const appId = decodeURIComponent(mBotPromptInjection[1]);
+      const chunks: Buffer[] = [];
+      for await (const c of req) chunks.push(c as Buffer);
+      const upstream = await proxyToDaemon(appId, '/api/bot-prompt-injection', {
+        method: 'PUT', headers: { 'content-type': 'application/json' },
+        body: Buffer.concat(chunks).toString('utf8') || '{}',
+      });
+      res.writeHead(upstream.status, { 'content-type': 'application/json' });
+      res.end(await upstream.text());
+      return;
+    }
+
     // PUT /api/bots/:appId/reply-delivery — proxy to that bot's daemon.
     // Body `{ replyDelivery: 'transcript'|'send'|'' }` (''/other clears back to
     // the default send). 最终回复投递方式的 per-bot 开关；'send' 与 'transcript'
@@ -7561,7 +7671,7 @@ const server = createServer(async (req, res) => {
 
     // PUT /api/bots/:appId/grant-prefs — proxy to that bot's daemon. Body carries
     // any subset of `{ restrictGrantCommands?: boolean, autoGrantRequestCards?: boolean,
-    // p2pOpen?: boolean, messageQuotaDefaultLimit?: number|null,
+    // p2pOpen?: boolean, grantRequestToOwnerDm?: boolean, messageQuotaDefaultLimit?: number|null,
     // grantDefaultDurationMs?: number|null }`.
     let mBotGrantPrefs: RegExpMatchArray | null;
     if (req.method === 'PUT' && (mBotGrantPrefs = url.pathname.match(/^\/api\/bots\/([^/]+)\/grant-prefs$/))) {
@@ -7717,6 +7827,11 @@ const server = createServer(async (req, res) => {
       try { bot = loadBotConfigs().find(item => !item.apiOnly && (!appId || item.larkAppId === appId)); }
       catch { /* handled below */ }
       if (!bot) return jsonRes(res, 404, { ok: false, error: 'bot_not_found' });
+      try { bot = withFeedGroupOwner(bot); }
+      catch (error) {
+        const e = error as FeedGroupApiError;
+        return jsonRes(res, e.status, { ok: false, error: e.code, message: e.message });
+      }
       const { authUrl } = generateAuthUrl(
         bot.larkAppId,
         bot.larkAppSecret,
@@ -7752,7 +7867,7 @@ const server = createServer(async (req, res) => {
       let loginRequired = false;
       for (const bot of ordered) {
         try {
-          const groups = await listFeedGroups(bot);
+          const groups = await listFeedGroups(withFeedGroupOwner(bot));
           return jsonRes(res, 200, { ok: true, larkAppId: bot.larkAppId, groups });
         } catch (error) {
           if (error instanceof FeedGroupApiError && error.code === 'user_login_required') {
@@ -7888,7 +8003,8 @@ const server = createServer(async (req, res) => {
         const feedGroupAppId = typeof parsed.feedGroupAppId === 'string' ? parsed.feedGroupAppId.trim() : '';
         if (upstream.ok && upstreamJson.ok && typeof upstreamJson.chatId === 'string' && (existingFeedGroupId || newFeedGroupName)) {
           try {
-            const feedBot = loadBotConfigs().find(bot => bot.larkAppId === feedGroupAppId && !bot.apiOnly);
+            const configuredFeedBot = loadBotConfigs().find(bot => bot.larkAppId === feedGroupAppId && !bot.apiOnly);
+            const feedBot = configuredFeedBot ? withFeedGroupOwner(configuredFeedBot) : undefined;
             if (!feedBot) {
               upstreamJson.feedGroupError = '读取标签所用的机器人当前不可用。群聊已创建，但未加入标签。';
             } else {
@@ -8000,7 +8116,8 @@ const server = createServer(async (req, res) => {
       if (existingFeedGroupId || newFeedGroupName) {
         const feedGroupAppId = typeof parsed.feedGroupAppId === 'string' ? parsed.feedGroupAppId.trim() : '';
         try {
-          const feedBot = loadBotConfigs().find(bot => bot.larkAppId === feedGroupAppId && !bot.apiOnly);
+          const configuredFeedBot = loadBotConfigs().find(bot => bot.larkAppId === feedGroupAppId && !bot.apiOnly);
+          const feedBot = configuredFeedBot ? withFeedGroupOwner(configuredFeedBot) : undefined;
           if (!feedBot) {
             feedGroupError = '读取标签所用的机器人当前不可用。';
           } else {

@@ -95,6 +95,10 @@ const mockResolveUnionIdFromOpenId = vi.fn(async () => null as string | null);
 const mockIsHumanOpenId = vi.fn(async () => false);
 // best-effort profile 查询（授权申请卡取申请人名字用）：默认查不到 → 卡片回落缩略身份。
 const mockGetUserProfile = vi.fn(async () => null as { name: string } | null);
+// 自助申请卡转投管理员私聊（p2p / 群里无管理员）：发卡、查群成员、取群名。
+const mockSendUserMessage = vi.fn(async () => 'om_dm_card');
+const mockListChatMemberOpenIds = vi.fn(async () => [] as string[]);
+const mockGetChatName = vi.fn(async () => null as string | null);
 const mockSignedChatContext = vi.fn();
 vi.mock('../src/im/lark/client.js', () => ({
   getChatContext: (...args: any[]) => mockSignedChatContext(...args),
@@ -113,6 +117,9 @@ vi.mock('../src/im/lark/client.js', () => ({
   resolveCurrentChatBotOpenIdsByLarkAppIds: (...args: any[]) => mockResolveCurrentChatBotOpenIds(...(args as [string, string, string[]])),
   listThreadMessages: (...args: any[]) => mockListThreadMessages(...args),
   getUserProfile: (...args: any[]) => mockGetUserProfile(...args),
+  sendUserMessage: (...args: any[]) => mockSendUserMessage(...args),
+  listChatMemberOpenIds: (...args: any[]) => mockListChatMemberOpenIds(...args),
+  getChatName: (...args: any[]) => mockGetChatName(...args),
 }));
 
 vi.mock('../src/utils/logger.js', () => ({
@@ -850,6 +857,7 @@ function setupBotState(opts?: {
 	  regularGroupMentionMode?: 'always' | 'topic' | 'never' | 'ambient';
 	  autoStartOnNewTopic?: boolean;
 	  autoGrantRequestCards?: boolean;
+	  grantRequestToOwnerDm?: boolean;
 	  grantDefaultDurationMs?: number;
 	  messageListeners?: Record<string, unknown>;
 	  commandTriggers?: { enabled: boolean; commands: Array<{ cmd: string; prompt?: string }>; chats?: string[]; excludedChats?: string[] };
@@ -888,6 +896,7 @@ function setupBotState(opts?: {
       regularGroupMentionMode: opts?.regularGroupMentionMode,
       autoStartOnNewTopic: opts?.autoStartOnNewTopic,
       autoGrantRequestCards: opts?.autoGrantRequestCards,
+      grantRequestToOwnerDm: opts?.grantRequestToOwnerDm,
 	      grantDefaultDurationMs: opts?.grantDefaultDurationMs,
 	      messageListeners: opts?.messageListeners,
 	      commandTriggers: opts?.commandTriggers,
@@ -3218,7 +3227,7 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     expect(handlers.handleNewTopic).not.toHaveBeenCalled();
   });
 
-  it('路由侧与 daemon 侧的 @ 剥离同源：本 bot 的 @ 占住指令参数位时，两边都判「不是指令头」', () => {
+  it('路由侧与 daemon 侧的 @ 剥离同源：本 bot 的 @ 占住指令参数位时，两边都判「不是指令头」', async () => {
     // 路由这边曾经只剥前导 @，于是 `重构登录 /t /model @机器人` 在这里解析成
     //「合法头部（模型名 = @机器人）」、在 daemon 那边解析成「/model 缺参数」——
     // 路由已经把 scope 翻成新话题，daemon 才回一句用法错误，错误提示落进一个
@@ -3230,12 +3239,12 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     };
     const routing = { scope: 'chat' as const, anchor: 'oc_chat' };
 
-    expect(maybeApplyForceTopicOverride(routing, message, 'om_inbound', MY_APP_ID)).toBe(false);
+    expect(await maybeApplyForceTopicOverride(routing, message, 'om_inbound', MY_APP_ID)).toBe(false);
     // 没有被翻成新话题 —— 拒绝会留在原地回复，不会先产生「开了个话题」这个副作用。
     expect(routing).toEqual({ scope: 'chat', anchor: 'oc_chat' });
   });
 
-  it('本 bot 的 @ 夹在正文里时，路由仍然认得出这是指令头', () => {
+  it('本 bot 的 @ 夹在正文里时，路由仍然认得出这是指令头', async () => {
     setupBotState({ botOpenId: MY_OPEN_ID });
     const message = {
       content: JSON.stringify({ text: '重构登录 /t /repo botmux 看看 @_user_1' }),
@@ -3243,13 +3252,13 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     };
     const routing = { scope: 'chat' as const, anchor: 'oc_chat' };
 
-    expect(maybeApplyForceTopicOverride(routing, message, 'om_inbound', MY_APP_ID)).toBe(true);
+    expect(await maybeApplyForceTopicOverride(routing, message, 'om_inbound', MY_APP_ID)).toBe(true);
     // forceTopicApplied 只在**真翻了**的时候置位（上一条没翻的用例里不出现），下游的
     // 授权闸靠它认出「这条 thread 路是 `/t` 挣来的」。
     expect(routing).toEqual({ scope: 'thread', anchor: 'om_inbound', forceTopicApplied: true });
   });
 
-  it('/th 与 /tw 生命周期别名在路由层翻成新话题（普通群 @bot /th 不再落进 chat-scope）', () => {
+  it('/th 与 /tw 生命周期别名在路由层翻成新话题（普通群 @bot /th 不再落进 chat-scope）', async () => {
     setupBotState({ botOpenId: MY_OPEN_ID });
     // 真实事故形态：普通群里「@bot /th @另一个bot 正文」被当普通消息，/th 失效。
     const withMention = {
@@ -3257,24 +3266,24 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
       mentions: [{ key: '@_user_1', name: 'Worker Claude Pro', id: { openId: OTHER_BOT_OPEN_ID }, id_type: 'open_id' }],
     };
     const r1 = { scope: 'chat' as const, anchor: 'oc_chat' };
-    expect(maybeApplyForceTopicOverride(r1, withMention, 'om_th', MY_APP_ID)).toBe(true);
+    expect(await maybeApplyForceTopicOverride(r1, withMention, 'om_th', MY_APP_ID)).toBe(true);
     expect(r1).toEqual({ scope: 'thread', anchor: 'om_th', forceTopicApplied: true });
 
     // /tw 同样翻 scope（worktree 模式由 daemon 单独推导，不把 worktree 注入正文）。
     const tw = { content: JSON.stringify({ text: '/tw 修复登录' }), mentions: [] };
     const r2 = { scope: 'chat' as const, anchor: 'oc_chat' };
-    expect(maybeApplyForceTopicOverride(r2, tw, 'om_tw', MY_APP_ID)).toBe(true);
+    expect(await maybeApplyForceTopicOverride(r2, tw, 'om_tw', MY_APP_ID)).toBe(true);
     expect(r2).toEqual({ scope: 'thread', anchor: 'om_tw', forceTopicApplied: true });
   });
 
-  it('/th /tw 归一与 daemon 同源：不把 here/worktree 注入正文，指令头仍按原词 fail-closed', () => {
+  it('/th /tw 归一与 daemon 同源：不把 here/worktree 注入正文，指令头仍按原词 fail-closed', async () => {
     setupBotState({ botOpenId: MY_OPEN_ID });
     // Codex CR (#1385)：旧实现把 /th 归一成 `/t here /model`，parseTopicHeader 把 here
     // 当 prompt、漏掉 /model 缺参数而误翻 scope。daemon 是把别名仅归一成 `/t`（余下
     // 原样）再判 missing_arg。故缺参数的 /model /effort 必须不翻 scope，错误留在原地。
     for (const text of ['/th /model', '/tw /model', '/th /effort', '/tw /effort']) {
       const routing = { scope: 'chat' as const, anchor: 'oc_chat' };
-      expect(maybeApplyForceTopicOverride(routing, { content: JSON.stringify({ text }), mentions: [] }, 'om_bad', MY_APP_ID)).toBe(false);
+      expect(await maybeApplyForceTopicOverride(routing, { content: JSON.stringify({ text }), mentions: [] }, 'om_bad', MY_APP_ID)).toBe(false);
       expect(routing).toEqual({ scope: 'chat', anchor: 'oc_chat' });
     }
 
@@ -3282,21 +3291,21 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     // 不进正文，故 directive 仍被正常解析）。
     const modelVal = { content: JSON.stringify({ text: '/tw /model gpt-5 做点事' }), mentions: [] };
     const r1 = { scope: 'chat' as const, anchor: 'oc_chat' };
-    expect(maybeApplyForceTopicOverride(r1, modelVal, 'om_m', MY_APP_ID)).toBe(true);
+    expect(await maybeApplyForceTopicOverride(r1, modelVal, 'om_m', MY_APP_ID)).toBe(true);
     expect(r1).toEqual({ scope: 'thread', anchor: 'om_m', forceTopicApplied: true });
 
     // /repo 允许裸形式：/tw /repo 合法并翻 scope。
     const bareRepo = { content: JSON.stringify({ text: '/tw /repo' }), mentions: [] };
     const r2 = { scope: 'chat' as const, anchor: 'oc_chat' };
-    expect(maybeApplyForceTopicOverride(r2, bareRepo, 'om_repo', MY_APP_ID)).toBe(true);
+    expect(await maybeApplyForceTopicOverride(r2, bareRepo, 'om_repo', MY_APP_ID)).toBe(true);
     expect(r2).toEqual({ scope: 'thread', anchor: 'om_repo', forceTopicApplied: true });
   });
 
-  it('/th /tw 完整规格语义校验失败时不翻 scope', () => {
+  it('/th /tw 完整规格语义校验失败时不翻 scope', async () => {
     setupBotState({ botOpenId: MY_OPEN_ID });
     for (const text of ['/tw /repo does-not-exist task', '/th /model unsupported task']) {
       const routing = { scope: 'chat' as const, anchor: 'oc_chat' };
-      expect(maybeApplyForceTopicOverride(
+      expect(await maybeApplyForceTopicOverride(
         routing,
         { content: JSON.stringify({ text }), mentions: [] },
         'om_invalid',
@@ -3307,14 +3316,19 @@ describe('im.message.receive_v1 — bot-to-bot @mention routing', () => {
     }
   });
 
-  it('/th /tw 必须是行首完整 token，正文里提到 /the 或 /two 不触发翻话题', () => {
+  it('/th /tw 必须是完整 token：/the /two 不触发；标题后的 /th 是带标题的生命周期头', async () => {
     setupBotState({ botOpenId: MY_OPEN_ID });
-    for (const text of ['请看 /the 文档', '/two issues', '前缀 /th 不在行首']) {
+    for (const text of ['请看 /the 文档', '/two issues']) {
       const message = { content: JSON.stringify({ text }), mentions: [] };
       const routing = { scope: 'chat' as const, anchor: 'oc_chat' };
-      expect(maybeApplyForceTopicOverride(routing, message, 'om_x', MY_APP_ID)).toBe(false);
+      expect(await maybeApplyForceTopicOverride(routing, message, 'om_x', MY_APP_ID)).toBe(false);
       expect(routing).toEqual({ scope: 'chat', anchor: 'oc_chat' });
     }
+    // 解析只有一处：`/th` 不再要求锚在行首。`前缀 /th …` 是带标题的生命周期头，要翻 scope。
+    const titled = { content: JSON.stringify({ text: '前缀 /th 不在行首' }), mentions: [] };
+    const titledRouting = { scope: 'chat' as const, anchor: 'oc_chat' };
+    expect(await maybeApplyForceTopicOverride(titledRouting, titled, 'om_titled', MY_APP_ID)).toBe(true);
+    expect(titledRouting).toEqual({ scope: 'thread', anchor: 'om_titled', forceTopicApplied: true });
   });
 
   it('still drops an unknown-peer bot on the /topic alias too (alias must not bypass either)', async () => {
@@ -6041,6 +6055,102 @@ describe('im.message.receive_v1 — p2p chat-mode topic reply anchoring', () => 
   });
 });
 
+describe('im.message.receive_v1 — p2p from a non-allowed user (grantRequestToOwnerDm)', () => {
+  let handlers: ReturnType<typeof makeHandlers>;
+  const OWNER = 'ou_owner_dm';
+  const STRANGER = 'ou_stranger_dm';
+
+  beforeEach(() => {
+    capturedHandlers = {};
+    _resetGrantPending();
+    mockReplyMessage.mockClear();
+    mockSendUserMessage.mockReset().mockResolvedValue('om_dm_card');
+    mockGetOwnerOpenId.mockReset().mockReturnValue(OWNER);
+    mockGetUserProfile.mockReset().mockResolvedValue({ name: '访客甲' });
+    mockFindOncallChat.mockReturnValue(undefined);
+    mockGetChatMode.mockResolvedValue('p2p');
+  });
+
+  function strangerDm(messageId: string) {
+    return makeUserMessageEvent({
+      senderOpenId: STRANGER,
+      content: JSON.stringify({ text: '你好，想问个问题' }),
+      messageId,
+      chatId: 'oc_dm_stranger',
+      chatType: 'p2p',
+    });
+  }
+
+  it('default (grantRequestToOwnerDm off) keeps the old silent drop', async () => {
+    setupBotState({ allowedUsers: [OWNER] });
+    handlers = makeHandlers();
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](strangerDm('msg-dm-stranger-default'));
+    await flushEventWork();
+
+    expect(mockSendUserMessage).not.toHaveBeenCalled();
+    expect(mockReplyMessage).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+  });
+
+  it('sends the request card to the owner DM, acks the requester without owner identity, never starts a session', async () => {
+    setupBotState({ allowedUsers: [OWNER], grantRequestToOwnerDm: true });
+    handlers = makeHandlers();
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](strangerDm('msg-dm-stranger-1'));
+    await flushEventWork();
+
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+    expect(handlers.handleThreadReply).not.toHaveBeenCalled();
+    expect(mockSendUserMessage).toHaveBeenCalledTimes(1);
+    const [appId, to, card, msgType] = mockSendUserMessage.mock.calls[0] as any[];
+    expect([appId, to, msgType]).toEqual([MY_APP_ID, OWNER, 'interactive']);
+    expect(card).toContain('访客甲');
+    expect(card).toContain('"delivery":"dm_p2p"');
+    expect(card).toContain('"chat_id":"oc_dm_stranger"');
+    // 申请人只收到中性回执：reply 到自己那条消息，内容不含 owner 身份
+    expect(mockReplyMessage).toHaveBeenCalledTimes(1);
+    const [, replyTo, ack] = mockReplyMessage.mock.calls[0] as any[];
+    expect(replyTo).toBe('msg-dm-stranger-1');
+    expect(ack).not.toContain(OWNER);
+    // pending 已开：同一人继续发不会重复发卡
+    await capturedHandlers['im.message.receive_v1'](strangerDm('msg-dm-stranger-2'));
+    await flushEventWork();
+    expect(mockSendUserMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('autoGrantRequestCards=false wins over grantRequestToOwnerDm (silent drop)', async () => {
+    setupBotState({ allowedUsers: [OWNER], autoGrantRequestCards: false, grantRequestToOwnerDm: true });
+    handlers = makeHandlers();
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+
+    await capturedHandlers['im.message.receive_v1'](strangerDm('msg-dm-stranger-off'));
+    await flushEventWork();
+
+    expect(mockSendUserMessage).not.toHaveBeenCalled();
+    expect(mockReplyMessage).not.toHaveBeenCalled();
+    expect(handlers.handleNewTopic).not.toHaveBeenCalled();
+  });
+
+  it('owner DM send failure → requester gets nothing and can retry later (pending cleared)', async () => {
+    setupBotState({ allowedUsers: [OWNER], grantRequestToOwnerDm: true });
+    handlers = makeHandlers();
+    startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+    mockSendUserMessage.mockRejectedValueOnce(new Error('dm failed'));
+
+    await capturedHandlers['im.message.receive_v1'](strangerDm('msg-dm-stranger-fail'));
+    await flushEventWork();
+
+    expect(mockReplyMessage).not.toHaveBeenCalled();
+    await capturedHandlers['im.message.receive_v1'](strangerDm('msg-dm-stranger-retry'));
+    await flushEventWork();
+    expect(mockSendUserMessage).toHaveBeenCalledTimes(2);
+  });
+});
+
 describe('im.message.receive_v1 — regular group reply mode (tri-state: chat | new-topic | shared)', () => {
   let handlers: ReturnType<typeof makeHandlers>;
 
@@ -6877,7 +6987,7 @@ describe('im.message.receive_v1 — /t force-topic override', () => {
 
   it('resolves multiple mention keys (multi-bot @ /t scenario)', async () => {
     // User @s two bots in front of /t. Both keys must be resolved/stripped
-    // before parseForceTopicInvocation sees the prefix.
+    // before parseTopicHeader sees the prefix.
     const event = makeUserMessageEvent({
       senderOpenId: USER_OPEN_ID,
       content: JSON.stringify({ text: '@_bot_a @_bot_b /t multi-bot' }),
@@ -6963,6 +7073,27 @@ describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic)
     handlers = makeHandlers();
     handlers.isSessionOwner.mockReturnValue(false);
     startLarkEventDispatcher(MY_APP_ID, 'secret', handlers);
+  });
+
+  it.each([['oc_quiet', false], ['oc_other', true]])('human seed in %s respects excluded chats', async (chatId, starts) => {
+    setupAutoTopicBot(true);
+    mockGetBot().config.autoStartExcludedChats = ['oc_quiet'];
+    mockGetChatMode.mockResolvedValue('topic');
+    const event = makeUserMessageEvent({ senderOpenId: USER_OPEN_ID, content: JSON.stringify({ text: 'task' }), messageId: 'msg-excluded-human', chatId, chatType: 'group' });
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+    expect(handlers.handleNewTopic).toHaveBeenCalledTimes(starts ? 1 : 0);
+  });
+
+  it('explicit mention still starts work in an excluded chat', async () => {
+    setupAutoTopicBot(true);
+    mockGetBot().config.autoStartExcludedChats = ['oc_quiet'];
+    mockGetBot().resolvedAllowedUsers = [USER_OPEN_ID];
+    mockGetChatMode.mockResolvedValue('topic');
+    const event = makeUserMessageEvent({ senderOpenId: USER_OPEN_ID, content: JSON.stringify({ text: '@_bot_a task' }), messageId: 'msg-excluded-mention', chatId: 'oc_quiet', chatType: 'group', mentions: [{ key: '@_bot_a', name: 'BotA', id: { open_id: MY_OPEN_ID } }] });
+    await capturedHandlers['im.message.receive_v1'](event);
+    await flushEventWork();
+    expect(handlers.handleNewTopic).toHaveBeenCalledTimes(1);
   });
 
   it('话题群新话题（未 @）开关开 → 自动开工 (FR-6)', async () => {
@@ -7158,6 +7289,15 @@ describe('im.message.receive_v1 — 主动开工 场景② (autoStartOnNewTopic,
     event.message.thread_id = undefined as any;
     return event;
   }
+
+  it.each([['oc_quiet', false], ['oc_other', true]])('bot seed in %s respects excluded chats', async (chatId, starts) => {
+    setupAutoTopicBotSender(true, true);
+    mockGetBot().config.autoStartExcludedChats = ['oc_quiet'];
+    await capturedHandlers['im.message.receive_v1'](makeBotTopicSeed('msg-excluded-bot', chatId));
+    await flushEventWork();
+    expect(handlers.handleNewTopic).toHaveBeenCalledTimes(starts ? 1 : 0);
+    expect(mockReplyMessage).not.toHaveBeenCalled();
+  });
 
   it('已知 peer bot 开新话题（未 @）+ 开关开 → 自动开工', async () => {
     setupAutoTopicBotSender(true, true);

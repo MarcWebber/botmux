@@ -31,6 +31,12 @@ export interface PtyHandle {
    *  can read `~/.claude/sessions/<pid>.json` to follow Claude's authoritative
    *  current session id (which can rotate on resume / mid-session). */
   cliPid?: number;
+  /** Authoritative terminal snapshots, when supported by an observe backend. */
+  captureCurrentScreen?(): string;
+  captureInputState?(): {
+    viewport: string;
+    cursor: { x: number; y: number };
+  } | null;
   /**
    * An explicitly selected remote Codex App Server thread. When set, Codex
    * history-submit verification accepts only this session id instead of
@@ -182,6 +188,8 @@ export interface CliAdapter {
      *  send` is only for mid-turn pushes / attachments / cross-bot @. Omitted or
      *  'send' → today's text byte-for-byte. `noTransport` takes precedence. */
     replyDelivery?: 'send' | 'transcript';
+    /** Disable all Botmux-owned prompt and skill injection for this spawn. */
+    promptInjection?: 'default' | 'none';
     /** transcript-only: this session is a solo chat (owner + this bot). Drops
      *  the identity routing_rules (no other bot to route to). Ignored for
      *  'send'. */

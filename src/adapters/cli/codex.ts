@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process';
 import { existsSync, statSync, openSync, readSync, closeSync } from 'node:fs';
+import { assertNoGlobalBotmuxSkills } from '../../skills/zero-injection.js';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { CLI_MODEL_CHOICES } from './model-choices.js';
@@ -9,8 +10,11 @@ import { parseDebugModelsJson } from './model-catalog-json.js';
 import type { CliAdapter, PtyHandle } from './types.js';
 import { codexHistoryPath, codexHome, codexSessionsRoot } from '../../services/codex-paths.js';
 import { findCodexRolloutSetByPid } from '../../services/codex-transcript.js';
+import { prepareCodexTerminalStatusLine, refreshCodexTerminalSession } from '../../services/codex-terminal-session.js';
 import { discoverRolloutSessions } from '../../services/resumable-session-discovery.js';
 import { delay, scaleMs } from '../../utils/timing.js';
+import { t } from '../../i18n/index.js';
+import { codexStatusLineSetupNotice } from '../../services/codex-statusline-config.js';
 
 const CODEX_ACTIVE_BUSY_PATTERN = /Working[^\r\n]{0,160}esc to interrupt/i;
 const CODEX_STARTUP_READY_PATTERN = /│[ \t]+model:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│[ \t\r\n]*│[ \t]+directory:[ \t]+(?!loading\b)[^│\s][^│\r\n]*│/;
@@ -260,7 +264,10 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     authPaths: ['~/.codex'],
     get resolvedBin(): string { return (cachedBin ??= resolveCommand(rawBin)); },
 
-    buildArgs({ sessionId, resume, resumeSessionId, quietResume, forkSession, workingDir, model, reasoningEffort, disableCliBypass, bypassHookTrust, hideRateLimitModelNudge, readIsolation, remoteWsUrl, remoteThreadId, shellSubprocessEnv }) {
+    buildArgs({ sessionId, resume, resumeSessionId, quietResume, forkSession, workingDir, model, reasoningEffort, disableCliBypass, bypassHookTrust, hideRateLimitModelNudge, readIsolation, remoteWsUrl, remoteThreadId, shellSubprocessEnv, promptInjection }) {
+      if (promptInjection === 'none') {
+        assertNoGlobalBotmuxSkills(join(codexHome(), 'skills'));
+      }
       // Hybrid RPC input mode: attach this TUI to the botmux-owned app-server
       // thread. User input is delivered out-of-band via JSON-RPC (turn/start,
       // see codex-rpc-engine + worker), so the pane is a pure viewer — no paste
@@ -430,6 +437,13 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
     },
 
     async writeInput(pty: PtyHandle, content: string) {
+      const terminalSession = await refreshCodexTerminalSession(pty);
+      if (terminalSession.kind === 'unavailable') {
+        const setup = prepareCodexTerminalStatusLine(pty);
+        return { submitted: false, failureReason: setup
+          ? `${t('worker.codex_terminal_message_not_written')}\n${codexStatusLineSetupNotice(setup)}`
+          : t('worker.codex_terminal_identity_unavailable') };
+      }
       // Codex's input mode treats every literal \n as Enter. The old path
       // (`send-keys -l` with the whole multi-line blob) therefore submitted
       // each line as its own turn — a single Lark message fragmented into
@@ -467,12 +481,14 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       // Ownership filter for the shared global history.jsonl. An external App
       // Server viewer cannot own the rollout fd: `codex --remote` is merely a
       // second client and the existing App Server holds the actual thread. For
-      // that explicit mode accept ONLY its already-selected thread id. Normal
-      // local terminal sessions keep the PID/rollout ownership filter below.
+      // that explicit mode accept ONLY its already-selected thread id. A local
+      // daemon-backed TUI proves its exact thread through its live footer;
+      // embedded sessions retain the PID/rollout ownership filter.
       const cliPid = typeof pty.cliPid === 'number' && Number.isInteger(pty.cliPid) && pty.cliPid > 0
         ? pty.cliPid
         : undefined;
-      const expectedRemoteSid = typeof pty.expectedCodexSessionId === 'string'
+      const expectedRemoteSid = terminalSession.kind === 'terminal' ? terminalSession.sessionId
+        : typeof pty.expectedCodexSessionId === 'string'
         && pty.expectedCodexSessionId.trim()
         ? pty.expectedCodexSessionId.trim()
         : undefined;

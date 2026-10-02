@@ -27,7 +27,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { compileToBwrap, type FsPolicy } from '../cli/fs-policy.js';
 import { CA_BUNDLE_ENV_KEYS, PROXY_ENV_KEYS } from '../../utils/child-env.js';
 import { isStandaloneBinary } from '../../core/self-spawn.js';
-import { linuxIsolationLaunch } from '../../core/linux-isolation.js';
+import { linuxIsolationLaunch, linuxIsolationLaunchViaArgsFile } from '../../core/linux-isolation.js';
 import {
   MCP_GATEWAY_REQUIRED_ENV,
   MCP_GATEWAY_SOCKET_ENV,
@@ -581,6 +581,16 @@ function reclaimMaskMounts(sessionRoot: string): void {
   reclaimMaskEntries(entries);
 }
 
+/** Remove the known-empty mode-000 mask before recursive traversal. rmdir
+ * needs write permission on its parent, not read permission on the mask itself.
+ * Keep the mask mode unchanged and never follow a replacement symlink. */
+function removeSandboxTree(sessionRoot: string): void {
+  try {
+    if (lstatSync(sessionRoot).isDirectory()) rmdirSync(join(sessionRoot, 'empty'));
+  } catch { /* absent or replaced */ }
+  try { rmSync(sessionRoot, { recursive: true, force: true }); } catch { /* */ }
+}
+
 /** Spawn-setup rollback: reclaim the mountpoints we pre-created FROM THE
  *  IN-MEMORY accumulator (NOT the manifest — on the failure paths the manifest
  *  may never have been written, so reading it back would reclaim nothing and
@@ -590,7 +600,7 @@ function reclaimMaskMounts(sessionRoot: string): void {
  *  itself fails). */
 function rollbackSandboxSetup(sessionRoot: string, createdMasks: MaskMountEntry[]): void {
   reclaimMaskEntries(createdMasks);
-  try { rmSync(sessionRoot, { recursive: true, force: true }); } catch { /* */ }
+  removeSandboxTree(sessionRoot);
 }
 
 /** Create a mask mountpoint on the host (all missing ancestors too), pushing
@@ -645,6 +655,8 @@ export interface DirectSandboxSpawn {
   bin: string;
   /** Isolation launcher + bwrap args + '--' + original (bin, ...args). */
   args: string[];
+  /** Private NUL-separated bwrap options file used by compact tmux launches. */
+  argsFile?: string;
   /** Env overrides to merge into childEnv (HOME, PATH, BOTMUX_SEND_RELAY, proxies). */
   env: Record<string, string>;
   /** Outbox dir the daemon watcher must service. */
@@ -687,6 +699,8 @@ export function prepareDirectSandbox(opts: {
    *  breaks) or a namespace the policy never anchored. Absent/empty →
    *  unset in the child (default store, matching the policy's default resolution). */
   larkCliDataDir?: string | null;
+  /** Keep the large bwrap option list out of tmux's command parser. */
+  useBwrapArgsFile?: boolean;
 }): DirectSandboxSpawn | null {
   if (process.platform !== 'linux') return null;
   if (!ensureSandboxDeps()) return null;
@@ -902,18 +916,30 @@ export function prepareDirectSandbox(opts: {
   // unresolvable path falls back to the lexical form (bwrap will fail-closed).
   let execBin = opts.cliBin;
   try { execBin = realpathSync(opts.cliBin); } catch { /* keep lexical; spawn fails closed */ }
-  args.push('--', execBin, ...opts.cliArgs);
+  const command = [execBin, ...opts.cliArgs];
+  let compactLaunch: ReturnType<typeof linuxIsolationLaunchViaArgsFile> | null = null;
+  try {
+    compactLaunch = opts.useBwrapArgsFile
+      ? linuxIsolationLaunchViaArgsFile('bwrap', args, command, sessionRoot)
+      : null;
+  } catch (error) {
+    rollbackSandboxSetup(sessionRoot, createdMasks);
+    throw error;
+  }
+  if (!compactLaunch) args.push('--', ...command);
 
   return {
-    bin: launch.bin,
-    args: [...launch.args, ...args],
+    bin: compactLaunch?.bin ?? launch.bin,
+    args: compactLaunch?.args ?? [...launch.args, ...args],
+    ...(compactLaunch ? { argsFile: compactLaunch.argsFile } : {}),
     env,
     outbox,
     cleanup: () => {
+      compactLaunch?.cleanup();
       // Reclaim empty deny-mask mountpoints we created on the host BEFORE
       // dropping the manifest with the rest of the tree.
       reclaimMaskMounts(sessionRoot);
-      try { rmSync(sessionRoot, { recursive: true, force: true }); } catch { /* */ }
+      removeSandboxTree(sessionRoot);
     },
   };
 }
@@ -938,7 +964,7 @@ export function attachSandboxOutbox(opts: { sessionId: string; dataDir: string }
       // Reclaim empty deny-mask mountpoints we created on the host BEFORE
       // dropping the manifest with the rest of the tree.
       reclaimMaskMounts(sessionRoot);
-      try { rmSync(sessionRoot, { recursive: true, force: true }); } catch { /* */ }
+      removeSandboxTree(sessionRoot);
     },
   };
 }
@@ -993,7 +1019,7 @@ export function sweepOrphanSandboxes(dataDir: string, activeSessionIds: Set<stri
     // BEFORE removing the tree (which holds the manifest). Only runs once we've
     // confirmed no live bwrap references the sid (liveSandboxSids above).
     reclaimMaskMounts(sessionRoot);
-    try { rmSync(sessionRoot, { recursive: true, force: true }); } catch { /* */ }
+    removeSandboxTree(sessionRoot);
   }
 }
 
@@ -1028,6 +1054,7 @@ const RELAY_FLAGS_VAL = new Set([
   '--mention',
   '--quote',
   '--response-kind',
+  '--expected-link',
   '--as',
   '--layout',
   '--plugin-card-action',
@@ -1138,6 +1165,14 @@ export function validateRelayRequest(req: RelayRequest): { ok: true; value: Vali
       if (v.startsWith('--')) return { ok: false, error: `flag ${f} value must not be a flag` };
       if (f === '--response-kind' && !['progress', 'final', 'auxiliary'].includes(v)) {
         return { ok: false, error: 'flag --response-kind must be progress, final, or auxiliary' };
+      }
+      if (f === '--expected-link') {
+        if (v.length > 8192) return { ok: false, error: 'flag --expected-link must be an http(s) URL' };
+        let url: URL;
+        try { url = new URL(v); } catch { return { ok: false, error: 'flag --expected-link must be an http(s) URL' }; }
+        if (!['http:', 'https:'].includes(url.protocol)) {
+          return { ok: false, error: 'flag --expected-link must be an http(s) URL' };
+        }
       }
       if (f === '--as' && !['independent', 'suggestion'].includes(v)) {
         return { ok: false, error: 'flag --as must be independent or suggestion' };
