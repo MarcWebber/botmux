@@ -1,3 +1,4 @@
+import { privateReplyEnabled, sendPrivateReply } from './core/private-reply.js';
 import { buildZeroPromptInput, zeroPromptInjectionForBot, sessionPromptInjection, type PromptInjection } from './core/prompt-injection.js';
 import { stripDispatchCompletionProtocol } from './core/dispatch.js';
 import { execFileSync, type ChildProcess } from 'node:child_process';
@@ -3751,6 +3752,7 @@ function startMemoryDiagnostics(): ReturnType<typeof setInterval> | undefined {
  * address spaces never collide; the lookup just tries both.
  */
 function streamingCardDisabledFor(ds: DaemonSession, turnId?: string): boolean {
+  if (privateReplyEnabled(ds.session)) return true;
   if (ds.streamingCardForced) return false;
   try {
     const cfg = getBot(ds.larkAppId).config;
@@ -4131,6 +4133,14 @@ async function sessionReply(
   if (!transportAllowed) {
     logger.debug(`[lark-transport] suppressed reply for no-transport session (app=${appId} anchor=${anchor.substring(0, 16)})`);
     return '';
+  }
+  if (ds && privateReplyEnabled(ds.session)) {
+    await assertSendTopicsAvailable(appId,
+      [opts?.replyTarget?.mode === 'thread' ? opts.replyTarget.rootMessageId : anchor],
+      opts?.topicMessageLookup ?? getTopicMessageDetail, getBot(appId).config.topicUnavailablePolicy);
+    const privateMessageId = await sendPrivateReply(ds.session,
+      turnId, content, msgType, opts?.uuid);
+    if (privateMessageId !== undefined) return privateMessageId;
   }
   const hookContext = ds ? {
     sessionId: ds.session.sessionId,
